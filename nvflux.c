@@ -14,12 +14,15 @@
 #define MAX_CLOCKS 128
 #define READ_BUF 4096
 
+// Allowed commands
 static const char *allowed_cmds[] = {
     "performance", "balanced", "powersaver", "auto", "reset", "status", "clock", "--restore", NULL
 };
 
+// full path to nvidia-smi discovered at runtime
 static char nvsmipath[512] = {0};
 
+// find nvidia-smi in common places or PATH
 static int find_nvidia_smi(void) {
     const char *candidates[] = {
         "/usr/bin/nvidia-smi",
@@ -34,11 +37,12 @@ static int find_nvidia_smi(void) {
         }
     }
 
+    // search PATH
     const char *path = getenv("PATH");
     if (!path) return -1;
 
     char tmp[512];
-    snprintf(tmp, sizeof(tmp), "%s", path);
+    snprintf(tmp, sizeof(tmp), "%s", path);  // safe copy with null termination
 
     for (char *tok = strtok(tmp, ":"); tok; tok = strtok(NULL, ":")) {
         char candidate[512];
@@ -52,6 +56,8 @@ static int find_nvidia_smi(void) {
     return -1;
 }
 
+
+// Get state file path for the real user (not root)
 static void get_state_path(uid_t real_uid, char *out, size_t len) {
     struct passwd *pw = getpwuid(real_uid);
     const char *home = pw ? pw->pw_dir : getenv("HOME");
@@ -60,20 +66,20 @@ static void get_state_path(uid_t real_uid, char *out, size_t len) {
 }
 
 
+// write mode to state file (owner should be real user)
 static int write_state(uid_t real_uid, const char *mode) {
     char path[512];
     get_state_path(real_uid, path, sizeof(path));
-    
+    // open and write
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         return -1;
     }
-    
+    // write content
     ssize_t w = write(fd, mode, strlen(mode));
     (void)w; 
     write(fd, "\n", 1);
     close(fd);
-
     // chown file to real user
     if (chown(path, real_uid, -1) < 0 && errno != EPERM) {
         // ignore
@@ -81,6 +87,7 @@ static int write_state(uid_t real_uid, const char *mode) {
     return 0;
 }
 
+// read mode from state file; returns 1 on success
 static int read_state(uid_t real_uid, char *buf, size_t len) {
     char path[512];
     get_state_path(real_uid, path, sizeof(path));
@@ -92,6 +99,8 @@ static int read_state(uid_t real_uid, char *buf, size_t len) {
     return 1;
 }
 
+// execute nvidia-smi with argv (argv[0]=nvsmipath), capture stdout into outbuf (null-terminated)
+// return child exit status or -1 on error
 static int exec_capture(char *const argv[], char *outbuf, size_t outlen) {
     int pipefd[2];
     if (pipe(pipefd) < 0) return -1;
@@ -127,6 +136,7 @@ static int exec_capture(char *const argv[], char *outbuf, size_t outlen) {
     return -1;
 }
 
+// parse integers from CSV/noheader output into clocks array
 static int parse_clocks(const char *txt, int *clocks, int max) {
     int count = 0;
     const char *p = txt;
@@ -168,6 +178,7 @@ static int get_current_mem_clock(void) {
     return (int)strtol(p, NULL, 10);
 }
 
+// run nvidia-smi with given argv, not capturing output (return code)
 static int run_nvsmicmd(char *const argv[]) {
     pid_t pid = fork();
     if (pid < 0) return -1;
@@ -205,6 +216,7 @@ static int is_allowed(const char *cmd) {
     return 0;
 }
 
+// main
 int main(int argc, char **argv) {
     // must be invoked with one arg
     if (argc < 2) {
