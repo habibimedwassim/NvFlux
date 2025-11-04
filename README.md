@@ -13,7 +13,7 @@ nvflux allows desktop users to switch NVIDIA GPU power profiles without `sudo` b
 - **Multi-boot systems** where persistence settings need per-session control
 
 **Key Features:**
-- ✅ Minimal attack surface (allowlist-only commands)
+- ✅ Minimal security risk (allowlist-only commands)
 - ✅ No shell invocation (direct exec calls)
 - ✅ Per-user state persistence
 - ✅ Distro-agnostic (no systemd/compositor dependencies)
