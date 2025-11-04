@@ -204,3 +204,127 @@ static int is_allowed(const char *cmd) {
     for (const char **p = allowed_cmds; *p; ++p) if (strcmp(*p, cmd) == 0) return 1;
     return 0;
 }
+
+int main(int argc, char **argv) {
+    // must be invoked with one arg
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <performance|balanced|powersaver|auto|reset|status|clock|--restore>\n", argv[0]);
+        return 1;
+    }
+
+    // discover nvidia-smi
+    if (find_nvidia_smi() < 0) {
+        fprintf(stderr, "Error: nvidia-smi not found in common locations or PATH\n");
+        return 2;
+    }
+
+    // real user id (the person who invoked the program)
+    uid_t real_uid = getuid();   // real uid (not effective)
+    uid_t effective_uid = geteuid(); // should be root when installed setuid
+
+    // require that this binary runs with effective uid root (setuid) OR run by root
+    if (effective_uid != 0) {
+        fprintf(stderr, "Error: this program needs to be installed setuid root (installer will do this).\n");
+        return 3;
+    }
+
+    const char *cmd = argv[1];
+    if (!is_allowed(cmd)) {
+        fprintf(stderr, "Unknown or disallowed command: %s\n", cmd);
+        return 4;
+    }
+
+    // handle status and clock and --restore without changing state
+    if (strcmp(cmd, "status") == 0) {
+        char mode[128] = {0};
+        if (read_state(real_uid, mode, sizeof(mode))) {
+            mode[0] = (char)toupper((unsigned char)mode[0]);
+            printf("%s\n", mode);
+        } else {
+            printf("Auto\n");
+        }
+        return 0;
+    }
+
+    if (strcmp(cmd, "clock") == 0) {
+        int clk = get_current_mem_clock();
+        if (clk <= 0) { printf("Unavailable\n"); return 0; }
+        printf("%d MHz\n", clk);
+        return 0;
+    }
+
+    if (strcmp(cmd, "--restore") == 0) {
+        char mode[128] = {0};
+        if (!read_state(real_uid, mode, sizeof(mode))) return 0;
+        // find clocks
+        int clocks[MAX_CLOCKS];
+        int count = get_mem_clocks(clocks, MAX_CLOCKS);
+        if (count <= 0) { // can't detect, try reset
+            if (strcmp(mode, "auto") == 0 || strcmp(mode, "reset") == 0) reset_memory_clocks();
+            return 0;
+        }
+        int max = clocks[0];
+        int mid = clocks[count/2];
+        int low = clocks[count-1];
+        if (strcmp(mode, "performance") == 0) {
+            enable_persistence();
+            lock_memory_clocks(max);
+        } else if (strcmp(mode, "balanced") == 0) {
+            enable_persistence();
+            lock_memory_clocks(mid);
+        } else if (strcmp(mode, "powersaver") == 0) {
+            enable_persistence();
+            lock_memory_clocks(low);
+        } else {
+            reset_memory_clocks();
+        }
+        return 0;
+    }
+
+    // For mode-changing commands: determine clocks and execute privileged commands
+    int clocks[MAX_CLOCKS];
+    int count = get_mem_clocks(clocks, MAX_CLOCKS);
+    if (count <= 0) {
+        // fail safe: if we can't get supported clocks, only allow reset
+        if (strcmp(cmd, "auto") == 0 || strcmp(cmd, "reset") == 0) {
+            reset_memory_clocks();
+            write_state(real_uid, "auto");
+            printf("OK\n");
+            return 0;
+        }
+        fprintf(stderr, "Error: unable to query supported clocks (nvidia-smi failed)\n");
+        return 5;
+    }
+
+    int max = clocks[0];
+    int mid = clocks[count/2];
+    int low = clocks[count-1];
+
+    if (strcmp(cmd, "performance") == 0) {
+        enable_persistence();
+        lock_memory_clocks(max);
+        write_state(real_uid, "performance");
+        printf("OK\n");
+        return 0;
+    } else if (strcmp(cmd, "balanced") == 0) {
+        enable_persistence();
+        lock_memory_clocks(mid);
+        write_state(real_uid, "balanced");
+        printf("OK\n");
+        return 0;
+    } else if (strcmp(cmd, "powersaver") == 0) {
+        enable_persistence();
+        lock_memory_clocks(low);
+        write_state(real_uid, "powersaver");
+        printf("OK\n");
+        return 0;
+    } else if (strcmp(cmd, "auto") == 0 || strcmp(cmd, "reset") == 0) {
+        reset_memory_clocks();
+        write_state(real_uid, "auto");
+        printf("OK\n");
+        return 0;
+    }
+
+    // unreachable
+    return 0;
+}
