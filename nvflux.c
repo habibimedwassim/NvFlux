@@ -91,3 +91,94 @@ static int read_state(uid_t real_uid, char *buf, size_t len) {
     fclose(f);
     return 1;
 }
+
+static int exec_capture(char *const argv[], char *outbuf, size_t outlen) {
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return -1;
+    pid_t pid = fork();
+    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return -1; }
+    if (pid == 0) {
+        // child: set safe env, keep EUID (root) so nvidia-smi runs as root
+        // Close read end
+        close(pipefd[0]);
+        // dup stdout to pipe
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        // minimal environment
+        char *envp[] = { "PATH=/usr/bin:/usr/local/bin", "LC_ALL=C", NULL };
+        // exec
+        execve(nvsmipath, argv, envp);
+        // if exec fails
+        _exit(127);
+    }
+    // parent
+    close(pipefd[1]);
+    ssize_t r = 0;
+    size_t off = 0;
+    while ((r = read(pipefd[0], outbuf + off, outlen - 1 - off)) > 0) {
+        off += (size_t)r;
+        if (off >= outlen - 1) break;
+    }
+    outbuf[off] = '\0';
+    close(pipefd[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return -1;
+}
+
+static int parse_clocks(const char *txt, int *clocks, int max) {
+    int count = 0;
+    const char *p = txt;
+    while (*p && count < max) {
+        // skip non-digit
+        while (*p && (*p < '0' || *p > '9')) p++;
+        if (!*p) break;
+        long v = strtol(p, (char**)&p, 10);
+        clocks[count++] = (int)v;
+    }
+    // sort descending (simple)
+    for (int i = 0; i < count - 1; ++i)
+        for (int j = 0; j < count - 1 - i; ++j)
+            if (clocks[j] < clocks[j+1]) {
+                int t = clocks[j]; clocks[j] = clocks[j+1]; clocks[j+1] = t;
+            }
+    return count;
+}
+
+// get supported memory clocks
+static int get_mem_clocks(int *clocks, int max) {
+    char out[READ_BUF];
+    char *argv[] = { nvsmipath, "--query-supported-clocks=memory", "--format=csv,noheader,nounits", NULL };
+    int rc = exec_capture(argv, out, sizeof(out));
+    if (rc < 0) return -1;
+    return parse_clocks(out, clocks, max);
+}
+
+// get current memory clock (single int)
+static int get_current_mem_clock(void) {
+    char out[READ_BUF];
+    char *argv[] = { nvsmipath, "--query-gpu=clocks.mem", "--format=csv,noheader,nounits", NULL };
+    int rc = exec_capture(argv, out, sizeof(out));
+    if (rc < 0) return -1;
+    // parse first int
+    const char *p = out;
+    while (*p && (*p < '0' || *p > '9')) p++;
+    if (!*p) return -1;
+    return (int)strtol(p, NULL, 10);
+}
+
+static int run_nvsmicmd(char *const argv[]) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        // child: safe env
+        char *envp[] = { "PATH=/usr/bin:/usr/local/bin", "LC_ALL=C", NULL };
+        execve(nvsmipath, argv, envp);
+        _exit(127);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return -1;
+}
