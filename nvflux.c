@@ -182,3 +182,25 @@ static int run_nvsmicmd(char *const argv[]) {
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     return -1;
 }
+
+// safe wrappers for specific allowed operations
+static int enable_persistence(void) {
+    char *argv[] = { nvsmipath, "-pm", "1", NULL };
+    return run_nvsmicmd(argv);
+}
+static int lock_memory_clocks(int memclk) {
+    char arg[64];
+    snprintf(arg, sizeof(arg), "--lock-memory-clocks=%d,%d", memclk, memclk);
+    char *argv[] = { nvsmipath, arg, NULL };
+    return run_nvsmicmd(argv);
+}
+static int reset_memory_clocks(void) {
+    char *argv[] = { nvsmipath, "--reset-memory-clocks", NULL };
+    return run_nvsmicmd(argv);
+}
+
+// check if given string is in allowed list
+static int is_allowed(const char *cmd) {
+    for (const char **p = allowed_cmds; *p; ++p) if (strcmp(*p, cmd) == 0) return 1;
+    return 0;
+}
