@@ -455,25 +455,31 @@ int nvflux_run(int argc, char **argv) {
     if (strcmp(cmd, "performance") == 0) {
         int gfx = pick_clock_at_pct(gfx_clocks, gfx_count, GFX_PCT_PERFORMANCE);
         if (apply_profile(mem_max, gfx) != 0) return 1;
-        printf("Performance: memory %d MHz", mem_max);
-        if (gfx > 0) printf(", graphics %d MHz", gfx);
-        printf("\n");
+        int real_mem = get_current_mem_clock();
+        int real_gfx = get_current_graphics_clock();
+        printf("Performance: memory %d MHz, graphics %d MHz\n",
+               real_mem > 0 ? real_mem : mem_max,
+               real_gfx > 0 ? real_gfx : gfx);
         write_state(real_uid, "performance");
         return 0;
     } else if (strcmp(cmd, "balanced") == 0) {
         int gfx = pick_clock_at_pct(gfx_clocks, gfx_count, GFX_PCT_BALANCED);
         if (apply_profile(mem_mid, gfx) != 0) return 1;
-        printf("Balanced: memory %d MHz", mem_mid);
-        if (gfx > 0) printf(", graphics %d MHz", gfx);
-        printf("\n");
+        int real_mem = get_current_mem_clock();
+        int real_gfx = get_current_graphics_clock();
+        printf("Balanced: memory %d MHz, graphics %d MHz\n",
+               real_mem > 0 ? real_mem : mem_mid,
+               real_gfx > 0 ? real_gfx : gfx);
         write_state(real_uid, "balanced");
         return 0;
     } else if (strcmp(cmd, "powersaver") == 0) {
         int gfx = pick_clock_at_pct(gfx_clocks, gfx_count, GFX_PCT_POWERSAVER);
         if (apply_profile(mem_low, gfx) != 0) return 1;
-        printf("Power Saver: memory %d MHz", mem_low);
-        if (gfx > 0) printf(", graphics %d MHz", gfx);
-        printf("\n");
+        int real_mem = get_current_mem_clock();
+        int real_gfx = get_current_graphics_clock();
+        printf("Power Saver: memory %d MHz, graphics %d MHz\n",
+               real_mem > 0 ? real_mem : mem_low,
+               real_gfx > 0 ? real_gfx : gfx);
         write_state(real_uid, "powersaver");
         return 0;
     } else if (strcmp(cmd, "auto") == 0 || strcmp(cmd, "reset") == 0) {
