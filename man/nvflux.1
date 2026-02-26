@@ -1,5 +1,5 @@
 .\" Manual page for nvflux
-.TH NVFLUX 1 "November 2025" "nvflux 1.0" "User Commands"
+.TH NVFLUX 1 "February 2026" "nvflux 1.1" "User Commands"
 .SH NAME
 nvflux \- manage NVIDIA GPU profiles (safe, limited nvidia-smi helper)
 .SH SYNOPSIS
@@ -7,28 +7,28 @@ nvflux \- manage NVIDIA GPU profiles (safe, limited nvidia-smi helper)
 [\fICOMMAND\fR]
 .SH DESCRIPTION
 nvflux is a small, minimal setuid-root helper that allows unprivileged users to run
-a constrained subset of nvidia-smi operations to change GPU persistence and memory
-clock behaviour. It is intended for desktop use so users can switch GPU profiles
-without sudo.
+a constrained subset of nvidia-smi operations to change GPU persistence, memory
+clock and graphics clock behaviour. It is intended for desktop use so users can
+switch GPU profiles without sudo.
 .SH COMMANDS
 .TP
 .B performance
-Lock GPU memory clocks to the highest supported value.
+Lock GPU memory and graphics clocks to the highest supported values.
 .TP
 .B balanced
-Lock GPU memory clocks to a mid-range supported value.
+Lock GPU memory and graphics clocks to mid-range supported values.
 .TP
 .B powersaver
-Lock GPU memory clocks to the lowest supported value.
+Lock GPU memory and graphics clocks to the lowest supported values.
 .TP
 .B auto, reset
-Reset memory clock locks so the driver can manage clocks automatically.
+Reset all clock locks so the driver can manage clocks automatically.
 .TP
 .B status
 Show last saved profile for the calling (real) user.
 .TP
 .B clock
-Print current GPU memory clock (MHz) as reported by nvidia-smi.
+Print current GPU memory and graphics clocks (MHz) as reported by nvidia-smi.
 .TP
 .B --restore
 Reapply last saved profile for the calling user (reads ~/.local/state/nvflux/state).

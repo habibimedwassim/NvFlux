@@ -13,6 +13,7 @@ nvflux allows desktop users to switch NVIDIA GPU power profiles without `sudo` b
 - **Multi-boot systems** where persistence settings need per-session control
 
 **Key Features:**
+- ✅ Memory & graphics clock (PowerMizer) control per profile
 - ✅ No security risk (allowlist-only commands)
 - ✅ No shell invocation (direct exec calls)
 - ✅ Per-user state persistence
@@ -57,7 +58,7 @@ nvflux auto         # or: nvflux reset
 
 # Query status
 nvflux status       # Show saved profile
-nvflux clock        # Show current memory clock (MHz)
+nvflux clock        # Show current memory & graphics clocks (MHz)
 
 # Restore on boot
 nvflux --restore    # Apply saved profile
@@ -96,6 +97,7 @@ nvflux (setuid root)
 **Security Model:**
 - Validates all commands against allowlist
 - No arbitrary string injection into nvidia-smi
+- Clock values are queried from GPU, never user-supplied
 - State files owned by real UID, not root
 - See [docs/SECURITY.md](docs/SECURITY.md) for full analysis
 

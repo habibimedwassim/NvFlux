@@ -12,7 +12,7 @@ fi
 echo "=== NVIDIA GPU Profile Switcher ==="
 echo ""
 echo "Current status: $(nvflux status)"
-echo "Current memory clock: $(nvflux clock) MHz"
+nvflux clock
 echo ""
 echo "Select profile:"
 echo "  1) Performance (highest clocks)"
@@ -52,4 +52,4 @@ esac
 
 echo ""
 echo "New status: $(nvflux status)"
-echo "New memory clock: $(nvflux clock) MHz"
+nvflux clock

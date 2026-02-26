@@ -9,6 +9,7 @@ nvflux is designed as a setuid-root binary with the following security principle
 - **No arbitrary command execution**: All nvidia-smi invocations use hardcoded argument patterns
 - **Input validation**: Command names are validated before any privileged operations
 - **Path safety**: nvidia-smi path is validated with `access(X_OK)` before use
+- **Clock values are queried from the GPU**: No user-supplied clock values are passed to nvidia-smi
 
 ### Privilege Management
 - Real UID is preserved for state file ownership

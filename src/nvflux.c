@@ -234,6 +234,67 @@ static int reset_memory_clocks(void) {
     return run_nvsmicmd(try2);
 }
 
+/* get supported graphics clocks */
+static int get_graphics_clocks(int *clocks, int max) {
+    char out[READ_BUF];
+    char *argv[] = { nvsmipath, "--query-supported-clocks=graphics", "--format=csv,noheader,nounits", NULL };
+    int rc = exec_capture(argv, out, sizeof(out));
+    if (rc < 0) return -1;
+    return nvflux_parse_clocks(out, clocks, max);
+}
+
+/* get current graphics clock */
+static int get_current_graphics_clock(void) {
+    char out[READ_BUF];
+    char *q1[] = { nvsmipath, "--query-gpu=clocks.gr", "--format=csv,noheader,nounits", NULL };
+    char *q2[] = { nvsmipath, "--query-gpu=clocks.current.graphics", "--format=csv,noheader,nounits", NULL };
+
+    if (exec_capture(q1, out, sizeof(out)) >= 0) {
+        const char *p = out;
+        while (*p && (*p < '0' || *p > '9')) p++;
+        if (*p) return (int)strtol(p, NULL, 10);
+    }
+    if (exec_capture(q2, out, sizeof(out)) >= 0) {
+        const char *p = out;
+        while (*p && (*p < '0' || *p > '9')) p++;
+        if (*p) return (int)strtol(p, NULL, 10);
+    }
+    return -1;
+}
+
+/* lock graphics clocks to gfxclk (best-effort) */
+static int lock_graphics_clocks(int gfxclk) {
+    char arg[64];
+    snprintf(arg, sizeof(arg), "--lock-gpu-clocks=%d,%d", gfxclk, gfxclk);
+    char *argv[] = { nvsmipath, arg, NULL };
+    return run_nvsmicmd(argv);
+}
+
+/* reset graphics clocks (unlock) */
+static int reset_graphics_clocks(void) {
+    char *try1[] = { nvsmipath, "--reset-gpu-clocks", NULL };
+    if (run_nvsmicmd(try1) == 0) return 0;
+    /* fallback: some drivers use broader reset */
+    char *try2[] = { nvsmipath, "--reset-clocks", NULL };
+    return run_nvsmicmd(try2);
+}
+
+/* apply a profile: enable persistence, lock memory and graphics clocks */
+static int apply_profile(int memclk, int gfxclk) {
+    if (enable_persistence() != 0) {
+        fprintf(stderr, "Failed to enable persistence mode\n");
+        return -1;
+    }
+    if (lock_memory_clocks(memclk) != 0) {
+        fprintf(stderr, "Failed to lock memory clocks to %d MHz\n", memclk);
+        return -1;
+    }
+    if (gfxclk > 0 && lock_graphics_clocks(gfxclk) != 0) {
+        fprintf(stderr, "Warning: could not lock graphics clocks to %d MHz (may require driver 510+)\n", gfxclk);
+    }
+    return 0;
+}
+
 /* check allowed */
 static int is_allowed(const char *cmd) {
     for (int i = 0; allowed_cmds[i]; ++i) if (strcmp(cmd, allowed_cmds[i]) == 0) return 1;
@@ -251,7 +312,7 @@ static int check_nvidia_runtime(void) {
         return -1;
     }
     /* if output contains "No devices were found" or is empty -> driver not present/working */
-    if (out[0] == '\0' || strstr(out, "No devices were found") || strstr(out, "No devices were found") ) {
+    if (out[0] == '\0' || strstr(out, "No devices were found")) {
         fprintf(stderr, "Error: no NVIDIA GPUs detected or driver not loaded.\n");
         fprintf(stderr, "Hint: install or enable the NVIDIA driver for your distro (see README).\n");
         return -2;
@@ -271,12 +332,12 @@ int nvflux_run(int argc, char **argv) {
         printf("Usage:\n");
         printf("  nvflux <command>\n\n");
         printf("Commands:\n");
-        printf("  performance     Lock GPU memory clocks to highest supported\n");
-        printf("  balanced        Lock GPU memory clocks to a mid value\n");
-        printf("  powersaver      Lock GPU memory clocks to lowest supported\n");
-        printf("  auto | reset    Reset GPU clock locks to automatic behavior\n");
+        printf("  performance     Lock GPU memory & graphics clocks to highest supported\n");
+        printf("  balanced        Lock GPU memory & graphics clocks to a mid value\n");
+        printf("  powersaver      Lock GPU memory & graphics clocks to lowest supported\n");
+        printf("  auto | reset    Reset all GPU clock locks to automatic behavior\n");
         printf("  status          Show last saved profile for the calling user\n");
-        printf("  clock           Print current memory clock (MHz)\n");
+        printf("  clock           Print current memory & graphics clocks (MHz)\n");
         printf("  --restore       Reapply last saved profile for the calling user\n");
         printf("  -h, --help      Show this help message\n\n");
         printf("Notes:\n");
@@ -324,9 +385,14 @@ int nvflux_run(int argc, char **argv) {
     }
 
     if (strcmp(cmd, "clock") == 0) {
-        int cur = get_current_mem_clock();
-        if (cur < 0) { fprintf(stderr, "Failed to query current memory clock\n"); return 1; }
-        printf("%d\n", cur);
+        int mem = get_current_mem_clock();
+        int gfx = get_current_graphics_clock();
+        if (mem < 0 && gfx < 0) {
+            fprintf(stderr, "Failed to query current clocks\n");
+            return 1;
+        }
+        if (mem >= 0) printf("Memory:   %d MHz\n", mem);
+        if (gfx >= 0) printf("Graphics: %d MHz\n", gfx);
         return 0;
     }
 
@@ -339,31 +405,46 @@ int nvflux_run(int argc, char **argv) {
         cmd = mode;
     }
 
-    int clocks[MAX_CLOCKS];
-    int count = get_mem_clocks(clocks, MAX_CLOCKS);
-    if (count <= 0) { fprintf(stderr, "Failed to query supported memory clocks\n"); return 1; }
+    int mem_clocks[MAX_CLOCKS];
+    int mem_count = get_mem_clocks(mem_clocks, MAX_CLOCKS);
+    if (mem_count <= 0) { fprintf(stderr, "Failed to query supported memory clocks\n"); return 1; }
 
-    int max = clocks[0];
-    int mid = clocks[count/2];
-    int low = clocks[count-1];
+    int gfx_clocks[MAX_CLOCKS];
+    int gfx_count = get_graphics_clocks(gfx_clocks, MAX_CLOCKS);
+
+    int mem_max = mem_clocks[0];
+    int mem_mid = mem_clocks[mem_count / 2];
+    int mem_low = mem_clocks[mem_count - 1];
+
+    int gfx_max = gfx_count > 0 ? gfx_clocks[0] : -1;
+    int gfx_mid = gfx_count > 0 ? gfx_clocks[gfx_count / 2] : -1;
+    int gfx_low = gfx_count > 0 ? gfx_clocks[gfx_count - 1] : -1;
 
     if (strcmp(cmd, "performance") == 0) {
-        if (enable_persistence() != 0) { fprintf(stderr, "Failed to enable persistence\n"); return 1; }
-        if (lock_memory_clocks(max) != 0) { fprintf(stderr, "Failed to lock memory clocks\n"); return 1; }
+        if (apply_profile(mem_max, gfx_max) != 0) return 1;
+        printf("Performance: memory %d MHz", mem_max);
+        if (gfx_max > 0) printf(", graphics %d MHz", gfx_max);
+        printf("\n");
         write_state(real_uid, "performance");
         return 0;
     } else if (strcmp(cmd, "balanced") == 0) {
-        if (enable_persistence() != 0) { fprintf(stderr, "Failed to enable persistence\n"); return 1; }
-        if (lock_memory_clocks(mid) != 0) { fprintf(stderr, "Failed to lock memory clocks\n"); return 1; }
+        if (apply_profile(mem_mid, gfx_mid) != 0) return 1;
+        printf("Balanced: memory %d MHz", mem_mid);
+        if (gfx_mid > 0) printf(", graphics %d MHz", gfx_mid);
+        printf("\n");
         write_state(real_uid, "balanced");
         return 0;
     } else if (strcmp(cmd, "powersaver") == 0) {
-        if (enable_persistence() != 0) { fprintf(stderr, "Failed to enable persistence\n"); return 1; }
-        if (lock_memory_clocks(low) != 0) { fprintf(stderr, "Failed to lock memory clocks\n"); return 1; }
+        if (apply_profile(mem_low, gfx_low) != 0) return 1;
+        printf("Power Saver: memory %d MHz", mem_low);
+        if (gfx_low > 0) printf(", graphics %d MHz", gfx_low);
+        printf("\n");
         write_state(real_uid, "powersaver");
         return 0;
     } else if (strcmp(cmd, "auto") == 0 || strcmp(cmd, "reset") == 0) {
         if (reset_memory_clocks() != 0) { fprintf(stderr, "Failed to reset memory clocks\n"); return 1; }
+        reset_graphics_clocks(); /* best-effort */
+        printf("Auto: clocks reset to driver-managed\n");
         write_state(real_uid, "auto");
         return 0;
     }
