@@ -12,8 +12,14 @@
 #include <sys/wait.h>
 #include <limits.h>
 
-#define MAX_CLOCKS 128
+#define MAX_CLOCKS 512   /* large enough for any GPU; deduplicated after sort */
 #define READ_BUF 4096
+
+/* Target percentile (from high end, 0=max clock, 100=min clock) per profile.
+ * These drive pick_clock_at_pct() and are the only place to tune behavior. */
+#define GFX_PCT_PERFORMANCE  5   /* near top:    ~95th pct by frequency  */
+#define GFX_PCT_BALANCED    50   /* middle:      ~50th pct by frequency  */
+#define GFX_PCT_POWERSAVER  95   /* near bottom: ~5th  pct by frequency  */
 
 /* allowed commands */
 static const char *allowed_cmds[] = {
@@ -147,7 +153,9 @@ static int exec_capture(char *const argv[], char *outbuf, size_t outlen, int cap
     return -1;
 }
 
-/* parse integers from CSV/noheader output into clocks array (descending) */
+/* parse integers from CSV/noheader output into clocks array (descending, deduped).
+ * nvidia-smi may repeat the same graphics clock values once per memory clock level;
+ * deduplication ensures percentile math operates on unique clock steps only. */
 int nvflux_parse_clocks(const char *txt, int *clocks, int max) {
     int count = 0;
     const char *p = txt;
@@ -158,7 +166,7 @@ int nvflux_parse_clocks(const char *txt, int *clocks, int max) {
         clocks[count++] = (int)v;
         while (*p && (*p == ',' || isspace((unsigned char)*p))) p++;
     }
-    /* sort descending simple selection */
+    /* sort descending */
     for (int i = 0; i < count; ++i) {
         int best = i;
         for (int j = i+1; j < count; ++j) if (clocks[j] > clocks[best]) best = j;
@@ -166,7 +174,22 @@ int nvflux_parse_clocks(const char *txt, int *clocks, int max) {
             int tmp = clocks[i]; clocks[i] = clocks[best]; clocks[best] = tmp;
         }
     }
-    return count;
+    /* deduplicate: remove consecutive equal values */
+    int unique = 0;
+    for (int i = 0; i < count; ++i) {
+        if (unique == 0 || clocks[i] != clocks[unique - 1])
+            clocks[unique++] = clocks[i];
+    }
+    return unique;
+}
+
+/* Select a clock from a sorted-descending deduplicated array by percentile.
+ * pct_from_top=0 → highest clock, pct_from_top=100 → lowest clock.
+ * Works correctly for any GPU regardless of how many clock steps it exposes. */
+static int pick_clock_at_pct(const int *clocks, int count, int pct_from_top) {
+    if (count <= 0) return -1;
+    int idx = (count - 1) * pct_from_top / 100;
+    return clocks[idx];
 }
 
 /* get supported memory clocks */
@@ -424,18 +447,13 @@ int nvflux_run(int argc, char **argv) {
     int mem_mid = mem_clocks[mem_count / 2];
     int mem_low = mem_clocks[mem_count - 1];
 
-    /* Query graphics clocks once; clocks[] is sorted descending.
-     * Index selection per profile:
-     *   performance  — top ~5%  (near max, lean high)
-     *   balanced     — 50th percentile (middle of range)
-     *   powersaver   — bottom ~5% (near min, lean low)
-     * Using count/20 as the step avoids hard-coding any frequency value. */
+    /* Query graphics clocks once (sorted descending, deduplicated).
+     * Pick by percentile from the high end using the named constants above. */
     int gfx_clocks[MAX_CLOCKS];
     int gfx_count = get_graphics_clocks(gfx_clocks, MAX_CLOCKS);
 
     if (strcmp(cmd, "performance") == 0) {
-        int idx = (gfx_count > 1) ? gfx_count / 20 : 0;
-        int gfx = gfx_count > 0 ? gfx_clocks[idx] : -1;
+        int gfx = pick_clock_at_pct(gfx_clocks, gfx_count, GFX_PCT_PERFORMANCE);
         if (apply_profile(mem_max, gfx) != 0) return 1;
         printf("Performance: memory %d MHz", mem_max);
         if (gfx > 0) printf(", graphics %d MHz", gfx);
@@ -443,8 +461,7 @@ int nvflux_run(int argc, char **argv) {
         write_state(real_uid, "performance");
         return 0;
     } else if (strcmp(cmd, "balanced") == 0) {
-        int idx = (gfx_count > 1) ? gfx_count / 2 : 0;
-        int gfx = gfx_count > 0 ? gfx_clocks[idx] : -1;
+        int gfx = pick_clock_at_pct(gfx_clocks, gfx_count, GFX_PCT_BALANCED);
         if (apply_profile(mem_mid, gfx) != 0) return 1;
         printf("Balanced: memory %d MHz", mem_mid);
         if (gfx > 0) printf(", graphics %d MHz", gfx);
@@ -452,9 +469,7 @@ int nvflux_run(int argc, char **argv) {
         write_state(real_uid, "balanced");
         return 0;
     } else if (strcmp(cmd, "powersaver") == 0) {
-        int step = (gfx_count > 1) ? gfx_count / 20 : 0;
-        int idx = (gfx_count > 1) ? (gfx_count - 1 - step) : 0;
-        int gfx = gfx_count > 0 ? gfx_clocks[idx] : -1;
+        int gfx = pick_clock_at_pct(gfx_clocks, gfx_count, GFX_PCT_POWERSAVER);
         if (apply_profile(mem_low, gfx) != 0) return 1;
         printf("Power Saver: memory %d MHz", mem_low);
         if (gfx > 0) printf(", graphics %d MHz", gfx);
