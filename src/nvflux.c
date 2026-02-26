@@ -276,16 +276,35 @@ static int reset_memory_clocks(void) {
     return run_nvsmicmd(try2);
 }
 
-/* get all supported graphics clocks (sorted descending).
- * NOTE: do NOT pass --mem-clock here — nvidia-smi prepends the mem clock value
- * to every CSV row when that option is used, which contaminates the parsed
- * output.  All memory clock levels share the same graphics clock range anyway. */
-static int get_graphics_clocks(int *clocks, int max) {
+/* get supported graphics clocks for a given memory clock level.
+ * stderr is silenced so nvidia-smi status messages cannot contaminate output.
+ * The memory clock value itself is explicitly excluded from results as a
+ * safeguard, since some driver versions echo it in the CSV rows.
+ * Falls back to a global query (no --mem-clock) if the per-level query
+ * returns fewer than 2 results (e.g. the driver rejected the argument). */
+static int get_graphics_clocks(int memclk, int *clocks, int max) {
     char out[READ_BUF];
-    char *argv[] = { nvsmipath, "--query-supported-clocks=graphics", "--format=csv,noheader,nounits", NULL };
-    int rc = exec_capture(argv, out, sizeof(out), 0);
-    if (rc < 0) return -1;
-    return nvflux_parse_clocks(out, clocks, max);
+    char memarg[64];
+    snprintf(memarg, sizeof(memarg), "--mem-clock=%d", memclk);
+    char *argv[] = { nvsmipath, "--query-supported-clocks=graphics", memarg,
+                     "--format=csv,noheader,nounits", NULL };
+    int count = 0;
+    if (exec_capture(argv, out, sizeof(out), 0) >= 0) {
+        count = nvflux_parse_clocks(out, clocks, max);
+        /* strip the memory clock value itself if it leaked into the output */
+        int filtered = 0;
+        for (int i = 0; i < count; ++i)
+            if (clocks[i] != memclk) clocks[filtered++] = clocks[i];
+        count = filtered;
+    }
+    if (count < 2) {
+        /* fallback: query all graphics clocks regardless of memory level */
+        char *fb[] = { nvsmipath, "--query-supported-clocks=graphics",
+                       "--format=csv,noheader,nounits", NULL };
+        if (exec_capture(fb, out, sizeof(out), 0) >= 0)
+            count = nvflux_parse_clocks(out, clocks, max);
+    }
+    return count;
 }
 
 /* Query the actual maximum lockable (non-boost) graphics clock.
@@ -560,16 +579,15 @@ int nvflux_run(int argc, char **argv) {
     int mem_mid = mem_clocks[mem_count / 2];
     int mem_low = mem_clocks[mem_count - 1];
 
-    /* Query graphics clocks once (sorted descending, deduplicated).
-     * Strip boost clocks the driver cannot actually lock to, then
-     * pick by percentile from the high end using the named constants above. */
-    int gfx_clocks[MAX_CLOCKS];
-    int gfx_count = get_graphics_clocks(gfx_clocks, MAX_CLOCKS);
+    /* max_lockable_gfx: the driver's actual ceiling for --lock-gpu-clocks.
+     * Queried once; used in every profile block to strip boost clocks. */
     int max_lockable_gfx = get_max_lockable_gfx_clock();
-    gfx_count = filter_lockable_clocks(gfx_clocks, gfx_count, max_lockable_gfx);
 
     if (strcmp(cmd, "performance") == 0) {
         if (check_temp_safety(1) != 0) return 1;
+        int gfx_clocks[MAX_CLOCKS];
+        int gfx_count = get_graphics_clocks(mem_max, gfx_clocks, MAX_CLOCKS);
+        gfx_count = filter_lockable_clocks(gfx_clocks, gfx_count, max_lockable_gfx);
         int gfx = pick_clock_at_pct(gfx_clocks, gfx_count, GFX_PCT_PERFORMANCE);
         int before_mem = get_current_mem_clock();
         int before_gfx = get_current_graphics_clock();
@@ -581,6 +599,9 @@ int nvflux_run(int argc, char **argv) {
         return 0;
     } else if (strcmp(cmd, "balanced") == 0) {
         if (check_temp_safety(1) != 0) return 1;
+        int gfx_clocks[MAX_CLOCKS];
+        int gfx_count = get_graphics_clocks(mem_mid, gfx_clocks, MAX_CLOCKS);
+        gfx_count = filter_lockable_clocks(gfx_clocks, gfx_count, max_lockable_gfx);
         int gfx = pick_clock_at_pct(gfx_clocks, gfx_count, GFX_PCT_BALANCED);
         int before_mem = get_current_mem_clock();
         int before_gfx = get_current_graphics_clock();
@@ -592,6 +613,12 @@ int nvflux_run(int argc, char **argv) {
         return 0;
     } else if (strcmp(cmd, "powersaver") == 0) {
         if (check_temp_safety(0) != 0) return 1;
+        /* Query graphics for mem_low; if the driver clamps mem_low to a higher
+         * level (e.g. 405->810), the fallback inside get_graphics_clocks will
+         * return the full range, which is still correct for 810 MHz. */
+        int gfx_clocks[MAX_CLOCKS];
+        int gfx_count = get_graphics_clocks(mem_low, gfx_clocks, MAX_CLOCKS);
+        gfx_count = filter_lockable_clocks(gfx_clocks, gfx_count, max_lockable_gfx);
         int gfx = pick_clock_at_pct(gfx_clocks, gfx_count, GFX_PCT_POWERSAVER);
         int before_mem = get_current_mem_clock();
         int before_gfx = get_current_graphics_clock();
