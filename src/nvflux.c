@@ -1,640 +1,582 @@
-#include "nvflux.h"
+/*
+ * nvflux.c — NvFlux profile logic and public API
+ *
+ * Implements the high-level profile modes (performance, balanced,
+ * powersave, auto, reset, status, clock, --restore) by coordinating
+ * the hardware layer (hw.h) and the state layer (state.h).
+ *
+ * nvflux_parse_clocks() is the only function published in nvflux.h and
+ * is tested directly by the unit-test suite.
+ */
+
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <pwd.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <ctype.h>
-#include <sys/wait.h>
-#include <limits.h>
+#include <time.h>
 
-#define MAX_CLOCKS 512   /* large enough for any GPU; deduplicated after sort */
-#define READ_BUF 4096
+#include "../include/nvflux.h"
+#include "../include/hw.h"
+#include "../include/state.h"
 
-/* Target percentile (from high end, 0=max clock, 100=min clock) per profile.
- * These drive pick_clock_at_pct() and are the only place to tune behavior. */
-#define GFX_PCT_PERFORMANCE  5   /* near top:    ~95th pct by frequency  */
-#define GFX_PCT_BALANCED    50   /* middle:      ~50th pct by frequency  */
-#define GFX_PCT_POWERSAVER  95   /* near bottom: ~5th  pct by frequency  */
+/* ------------------------------------------------------------------ */
+/*  Tuning constants                                                   */
+/* ------------------------------------------------------------------ */
 
-/* Temperature thresholds (degrees Celsius).
- * At WARN, the user is notified but the profile is still applied.
- * At LIMIT, applying a hotter profile (performance/balanced) is refused. */
-#define TEMP_WARN_C   80
-#define TEMP_LIMIT_C  90
+/* Graphics-clock percentile (from the top) for each profile */
+#define GFX_PCT_PERFORMANCE   5
+#define GFX_PCT_BALANCED     50
+#define GFX_PCT_POWERSAVE    95
 
-/* How long to wait for the driver to settle after locking clocks.
- * Polls every READBACK_POLL_MS up to READBACK_TIMEOUT_MS total. */
+/* Memory-clock percentile (from the top) for each profile */
+#define MEM_PCT_PERFORMANCE   0
+#define MEM_PCT_BALANCED     50
+#define MEM_PCT_POWERSAVE   100
+
+/* Temperature thresholds */
+#define TEMP_WARN_C   80          /* print a warning above this           */
+#define TEMP_LIMIT_C  90          /* refuse non-powersave above this      */
+
+/* Readback polling */
 #define READBACK_POLL_MS     100
-#define READBACK_TIMEOUT_MS  2000
+#define READBACK_TIMEOUT_MS 2000
 
-/* allowed commands */
-static const char *allowed_cmds[] = {
-    "performance", "balanced", "powersaver", "auto", "reset", "status", "clock", "--restore", NULL
-};
+/* ------------------------------------------------------------------ */
+/*  Public API — nvflux_parse_clocks                                   */
+/*                                                                     */
+/*  Parses a whitespace/comma/newline-separated integer list from txt, */
+/*  stores up to max values in clocks[], sorted descending.            */
+/*  Does NOT deduplicate (the unit tests rely on this behaviour).       */
+/*  Returns the count.                                                 */
+/* ------------------------------------------------------------------ */
 
-/* discovered nvidia-smi path */
-static char nvsmipath[512] = {0};
-
-/* find nvidia-smi in common locations or PATH */
-static int find_nvidia_smi(void) {
-    const char *candidates[] = { "/usr/bin/nvidia-smi", "/usr/local/bin/nvidia-smi", "/bin/nvidia-smi", NULL };
-    for (int i = 0; candidates[i]; ++i) {
-        if (access(candidates[i], X_OK) == 0) {
-            snprintf(nvsmipath, sizeof(nvsmipath), "%s", candidates[i]);
-            return 0;
-        }
-    }
-    const char *path = getenv("PATH");
-    if (!path) return -1;
-    char tmp[PATH_MAX];
-    strncpy(tmp, path, sizeof(tmp)-1);
-    tmp[sizeof(tmp)-1] = '\0';
-    char *p = tmp;
-    while (p) {
-        char *colon = strchr(p, ':');
-        if (colon) *colon = '\0';
-        char cand[PATH_MAX];
-        if (strlen(p) + 12 > sizeof(cand)) {
-            if (!colon) break;
-            p = colon + 1;
-            continue;
-        }
-        snprintf(cand, sizeof(cand), "%s/nvidia-smi", p);
-        if (access(cand, X_OK) == 0) {
-            if (strlen(cand) < sizeof(nvsmipath)) {
-                snprintf(nvsmipath, sizeof(nvsmipath), "%s", cand);
-                return 0;
-            }
-        }
-        if (!colon) break;
-        p = colon + 1;
-    }
-    return -1;
-}
-
-/* state path for real user */
-static void get_state_path(uid_t real_uid, char *out, size_t len) {
-    struct passwd *pw = getpwuid(real_uid);
-    const char *home = pw ? pw->pw_dir : NULL;
-    if (!home) home = "/";
-    snprintf(out, len, "%s/.local/state/nvflux/state", home);
-}
-
-/* write mode to state file (owned by real user) */
-static int write_state(uid_t real_uid, const char *mode) {
-    char path[PATH_MAX];
-    get_state_path(real_uid, path, sizeof(path));
-    char dir[PATH_MAX];
-    strncpy(dir, path, sizeof(dir));
-    char *slash = strrchr(dir, '/');
-    if (slash) {
-        *slash = '\0';
-        mkdir(dir, 0755); /* ignore errors */
-    }
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0) return -1;
-    if (fchown(fd, real_uid, -1) < 0) {
-        /* ignore; best effort */
-    }
-    ssize_t w = write(fd, mode, strlen(mode));
-    close(fd);
-    return (w == (ssize_t)strlen(mode)) ? 0 : -1;
-}
-
-/* read mode from state file; returns 1 on success */
-static int read_state(uid_t real_uid, char *buf, size_t len) {
-    char path[PATH_MAX];
-    get_state_path(real_uid, path, sizeof(path));
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return 0;
-    ssize_t r = read(fd, buf, len-1);
-    close(fd);
-    if (r <= 0) return 0;
-    buf[r] = '\0';
-    /* strip trailing newlines/spaces */
-    while (r > 0 && isspace((unsigned char)buf[r-1])) { buf[r-1] = '\0'; r--; }
-    return 1;
-}
-
-/* execute argv (argv[0]=path) and capture stdout into outbuf (NUL-terminated).
- * if capture_stderr is non-zero, stderr is merged into the output buffer;
- * otherwise stderr is silenced (redirected to /dev/null) so that nvidia-smi
- * error/warning messages cannot contaminate parsed numeric output. */
-static int exec_capture(char *const argv[], char *outbuf, size_t outlen, int capture_stderr) {
-    int pipefd[2];
-    if (pipe(pipefd) < 0) return -1;
-    pid_t pid = fork();
-    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return -1; }
-    if (pid == 0) {
-        /* child */
-        close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        if (capture_stderr) {
-            dup2(pipefd[1], STDERR_FILENO);
-        } else {
-            int devnull = open("/dev/null", O_WRONLY);
-            if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
-        }
-        close(pipefd[1]);
-        execv(argv[0], argv);
-        _exit(127);
-    }
-    /* parent */
-    close(pipefd[1]);
-    ssize_t total = 0;
-    while (total < (ssize_t)(outlen - 1)) {
-        ssize_t r = read(pipefd[0], outbuf + total, outlen - 1 - total);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        if (r == 0) break;
-        total += r;
-    }
-    close(pipefd[0]);
-    outbuf[total] = '\0';
-    int status = 0;
-    waitpid(pid, &status, 0);
-    if (WIFEXITED(status)) return WEXITSTATUS(status);
-    return -1;
-}
-
-/* parse integers from CSV/noheader output into clocks array (descending, deduped).
- * nvidia-smi may repeat the same graphics clock values once per memory clock level;
- * deduplication ensures percentile math operates on unique clock steps only. */
 int nvflux_parse_clocks(const char *txt, int *clocks, int max) {
-    int count = 0;
+    int n = 0;
     const char *p = txt;
-    while (*p && count < max) {
-        while (*p && (*p < '0' || *p > '9')) p++;
-        if (!*p) break;
-        long v = strtol(p, (char **)&p, 10);
-        clocks[count++] = (int)v;
-        while (*p && (*p == ',' || isspace((unsigned char)*p))) p++;
+    while (*p && n < max) {
+        while (*p && (*p < '0' || *p > '9'))
+            p++;
+        if (!*p)
+            break;
+        clocks[n++] = (int)strtol(p, (char **)&p, 10);
     }
-    /* sort descending */
-    for (int i = 0; i < count; ++i) {
-        int best = i;
-        for (int j = i+1; j < count; ++j) if (clocks[j] > clocks[best]) best = j;
-        if (best != i) {
-            int tmp = clocks[i]; clocks[i] = clocks[best]; clocks[best] = tmp;
+    /* insertion sort descending */
+    for (int i = 1; i < n; i++) {
+        int key = clocks[i], j = i - 1;
+        while (j >= 0 && clocks[j] < key) {
+            clocks[j + 1] = clocks[j];
+            j--;
         }
+        clocks[j + 1] = key;
     }
-    /* deduplicate: remove consecutive equal values */
-    int unique = 0;
-    for (int i = 0; i < count; ++i) {
-        if (unique == 0 || clocks[i] != clocks[unique - 1])
-            clocks[unique++] = clocks[i];
-    }
-    return unique;
+    return n;
 }
 
-/* Select a clock from a sorted-descending deduplicated array by percentile.
- * pct_from_top=0 → highest clock, pct_from_top=100 → lowest clock.
- * Works correctly for any GPU regardless of how many clock steps it exposes. */
+/* ------------------------------------------------------------------ */
+/*  Static helpers                                                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * pick_clock_at_pct — select an index from a sorted-descending array.
+ *   pct=0   → clocks[0]          (highest)
+ *   pct=100 → clocks[count-1]    (lowest)
+ */
 static int pick_clock_at_pct(const int *clocks, int count, int pct_from_top) {
     if (count <= 0) return -1;
     int idx = (count - 1) * pct_from_top / 100;
     return clocks[idx];
 }
 
-/* get supported memory clocks */
-static int get_mem_clocks(int *clocks, int max) {
-    char out[READ_BUF];
-    char *argv[] = { nvsmipath, "--query-supported-clocks=memory", "--format=csv,noheader,nounits", NULL };
-    int rc = exec_capture(argv, out, sizeof(out), 0);
-    if (rc < 0) return -1;
-    return nvflux_parse_clocks(out, clocks, max);
-}
-
-/* get current memory clock */
-static int get_current_mem_clock(void) {
-    char out[READ_BUF];
-    /* try a couple of query forms for compatibility with different nvidia-smi versions */
-    char *q1[] = { nvsmipath, "--query-gpu=clocks.mem", "--format=csv,noheader,nounits", NULL };
-    char *q2[] = { nvsmipath, "--query-gpu=memory.clock", "--format=csv,noheader,nounits", NULL };
-
-    if (exec_capture(q1, out, sizeof(out), 0) >= 0) {
-        /* parse first integer */
-        const char *p = out;
-        while (*p && (*p < '0' || *p > '9')) p++;
-        if (!*p) return -1;
-        return (int)strtol(p, NULL, 10);
-    }
-
-    if (exec_capture(q2, out, sizeof(out), 0) >= 0) {
-        const char *p = out;
-        while (*p && (*p < '0' || *p > '9')) p++;
-        if (!*p) return -1;
-        return (int)strtol(p, NULL, 10);
-    }
-
-    return -1;
-}
-
-/* run nvidia-smi without capture */
-static int run_nvsmicmd(char *const argv[]) {
-    pid_t pid = fork();
-    if (pid < 0) return -1;
-    if (pid == 0) {
-        execv(argv[0], argv);
-        _exit(127);
-    }
-    int status = 0;
-    waitpid(pid, &status, 0);
-    if (WIFEXITED(status)) return WEXITSTATUS(status);
-    return -1;
-}
-
-/* enable persistence mode */
-static int enable_persistence(void) {
-    char *argv[] = { nvsmipath, "-pm", "1", NULL }; /* fallback short option */
-    return run_nvsmicmd(argv);
-}
-
-/* lock memory clocks to memclk (best-effort) */
-static int lock_memory_clocks(int memclk) {
-    char arg[64];
-    /* some nvidia-smi variants expect two values (min,max) */
-    snprintf(arg, sizeof(arg), "--lock-memory-clocks=%d,%d", memclk, memclk);
-    char *argv[] = { nvsmipath, arg, NULL };
-    return run_nvsmicmd(argv);
-}
-
-/* reset memory clocks (unlock) */
-static int reset_memory_clocks(void) {
-    /* older/newer nvidia-smi have slightly different option names; try both */
-    char *try1[] = { nvsmipath, "--reset-memory-clocks", NULL };
-    char *try2[] = { nvsmipath, "--reset-locks", NULL };
-
-    if (run_nvsmicmd(try1) == 0) return 0;
-    return run_nvsmicmd(try2);
-}
-
-/* get supported graphics clocks for a given memory clock level.
- * stderr is silenced so nvidia-smi status messages cannot contaminate output.
- * The memory clock value itself is explicitly excluded from results as a
- * safeguard, since some driver versions echo it in the CSV rows.
- * Falls back to a global query (no --mem-clock) if the per-level query
- * returns fewer than 2 results (e.g. the driver rejected the argument). */
-static int get_graphics_clocks(int memclk, int *clocks, int max) {
-    char out[READ_BUF];
-    char memarg[64];
-    snprintf(memarg, sizeof(memarg), "--mem-clock=%d", memclk);
-    char *argv[] = { nvsmipath, "--query-supported-clocks=graphics", memarg,
-                     "--format=csv,noheader,nounits", NULL };
-    int count = 0;
-    if (exec_capture(argv, out, sizeof(out), 0) >= 0) {
-        count = nvflux_parse_clocks(out, clocks, max);
-        /* strip the memory clock value itself if it leaked into the output */
-        int filtered = 0;
-        for (int i = 0; i < count; ++i)
-            if (clocks[i] != memclk) clocks[filtered++] = clocks[i];
-        count = filtered;
-    }
-    if (count < 2) {
-        /* fallback: query all graphics clocks regardless of memory level */
-        char *fb[] = { nvsmipath, "--query-supported-clocks=graphics",
-                       "--format=csv,noheader,nounits", NULL };
-        if (exec_capture(fb, out, sizeof(out), 0) >= 0)
-            count = nvflux_parse_clocks(out, clocks, max);
-    }
-    return count;
-}
-
-/* Query the actual maximum lockable (non-boost) graphics clock.
- * --query-supported-clocks includes boost clocks that --lock-gpu-clocks cannot
- * honor; clocks.max.gr returns the real ceiling the driver will enforce.
- * Returns -1 if the query fails (caller should skip filtering in that case). */
-static int get_max_lockable_gfx_clock(void) {
-    char out[READ_BUF];
-    char *q[] = { nvsmipath, "--query-gpu=clocks.max.gr", "--format=csv,noheader,nounits", NULL };
-    if (exec_capture(q, out, sizeof(out), 0) < 0) return -1;
-    const char *p = out;
-    while (*p && (*p < '0' || *p > '9')) p++;
-    if (!*p) return -1;
-    return (int)strtol(p, NULL, 10);
-}
-
-/* Remove boost clocks from a sorted-descending deduplicated array in-place.
- * Any value above max_lockable is a boost clock the driver won't actually lock
- * to; strip them so percentile selection operates only on real lock targets. */
-static int filter_lockable_clocks(int *clocks, int count, int max_lockable) {
-    if (max_lockable <= 0) return count; /* query failed; keep all */
+/*
+ * filter_lockable_clocks — remove entries above max_lockable in place.
+ * Returns the new count.
+ */
+static int filter_lockable_clocks(int *clocks, int count, int max_lockable)
+{
     int out = 0;
-    for (int i = 0; i < count; ++i)
+    for (int i = 0; i < count; i++)
         if (clocks[i] <= max_lockable)
             clocks[out++] = clocks[i];
     return out;
 }
 
-/* get current graphics clock */
-static int get_current_graphics_clock(void) {
-    char out[READ_BUF];
-    char *q1[] = { nvsmipath, "--query-gpu=clocks.gr", "--format=csv,noheader,nounits", NULL };
-    char *q2[] = { nvsmipath, "--query-gpu=clocks.current.graphics", "--format=csv,noheader,nounits", NULL };
+/*
+ * mode_display_name — human-readable string for a mode identifier.
+ */
+static const char *mode_display_name(const char *mode)
+{
+    if (strcmp(mode, "performance") == 0) return "Performance";
+    if (strcmp(mode, "balanced")    == 0) return "Balanced";
+    if (strcmp(mode, "powersave")   == 0) return "Power Save";
+    if (strcmp(mode, "clock")       == 0) return "Custom Clock";
+    if (strcmp(mode, "auto")        == 0) return "Auto";
+    return mode;
+}
 
-    if (exec_capture(q1, out, sizeof(out), 0) >= 0) {
-        const char *p = out;
-        while (*p && (*p < '0' || *p > '9')) p++;
-        if (*p) return (int)strtol(p, NULL, 10);
+/*
+ * read_clocks_stable — poll until hardware clocks have changed away
+ * from the before_* snapshot AND settled for two consecutive identical
+ * reads.  Fills *out_mem and *out_gfx with the stabilised values.
+ * Returns 0 on success, -1 on timeout.
+ */
+static int read_clocks_stable(int before_mem, int before_gfx,
+                               int *out_mem, int *out_gfx)
+{
+    int prev_mem = -1, prev_gfx = -1;
+    int changed = 0;
+    int elapsed = 0;
+
+    while (elapsed < READBACK_TIMEOUT_MS) {
+        struct timespec ts = { 0, READBACK_POLL_MS * 1000000L };
+        nanosleep(&ts, NULL);
+        elapsed += READBACK_POLL_MS;
+
+        int cm = hw_current_mem_clock();
+        int cg = hw_current_graphics_clock();
+
+        if (!changed) {
+            if (cm != before_mem || cg != before_gfx)
+                changed = 1;
+        }
+
+        if (changed && cm == prev_mem && cg == prev_gfx) {
+            *out_mem = cm;
+            *out_gfx = cg;
+            return 0;
+        }
+        prev_mem = cm;
+        prev_gfx = cg;
     }
-    if (exec_capture(q2, out, sizeof(out), 0) >= 0) {
-        const char *p = out;
-        while (*p && (*p < '0' || *p > '9')) p++;
-        if (*p) return (int)strtol(p, NULL, 10);
-    }
+    /* timeout: return last observed values */
+    *out_mem = prev_mem;
+    *out_gfx = prev_gfx;
     return -1;
 }
 
-/* query GPU temperature in degrees Celsius; returns -1 on failure */
-static int get_gpu_temp(void) {
-    char out[READ_BUF];
-    char *argv[] = { nvsmipath, "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits", NULL };
-    if (exec_capture(argv, out, sizeof(out), 0) < 0) return -1;
-    const char *p = out;
-    while (*p && (*p < '0' || *p > '9')) p++;
-    if (!*p) return -1;
-    return (int)strtol(p, NULL, 10);
-}
-
-/* Poll until clocks change away from (before_mem, before_gfx) AND two
- * consecutive reads agree, meaning the driver has fully applied the new lock.
- * Falls back to whatever was last read if the timeout expires. */
-static void read_clocks_stable(int before_mem, int before_gfx, int *out_mem, int *out_gfx) {
-    int prev_mem = -1, prev_gfx = -1;
-    int elapsed = 0;
-    while (elapsed < READBACK_TIMEOUT_MS) {
-        usleep(READBACK_POLL_MS * 1000);
-        elapsed += READBACK_POLL_MS;
-        int mem = get_current_mem_clock();
-        int gfx = get_current_graphics_clock();
-        /* Wait until the values have moved away from the pre-lock snapshot */
-        if (mem == before_mem && gfx == before_gfx) {
-            prev_mem = mem; prev_gfx = gfx;
-            continue;
-        }
-        /* Then wait for two identical reads in a row (settled) */
-        if (mem == prev_mem && gfx == prev_gfx && mem > 0) {
-            *out_mem = mem;
-            *out_gfx = gfx;
-            return;
-        }
-        prev_mem = mem;
-        prev_gfx = gfx;
-    }
-    /* timeout: return whatever we last read */
-    *out_mem = prev_mem > 0 ? prev_mem : before_mem;
-    *out_gfx = prev_gfx > 0 ? prev_gfx : before_gfx;
-}
-
-/* Check GPU temperature and refuse or warn before applying a profile.
- * hot_profile: 1 if this is performance/balanced (higher load); 0 for powersaver. */
-static int check_temp_safety(int hot_profile) {
-    int temp = get_gpu_temp();
-    if (temp < 0) return 0; /* can't read temp, allow */
-    if (hot_profile && temp >= TEMP_LIMIT_C) {
-        fprintf(stderr,
-            "Error: GPU temperature is %d°C (>= %d°C limit).\n"
-            "       Cool down the GPU before applying a high-performance profile.\n",
-            temp, TEMP_LIMIT_C);
-        return -1;
-    }
-    if (temp >= TEMP_WARN_C) {
-        fprintf(stderr,
-            "Warning: GPU temperature is %d°C (>= %d°C threshold). "
-            "Monitor thermals.\n", temp, TEMP_WARN_C);
-    }
-    return 0;
-}
-
-/* lock graphics clocks to gfxclk (best-effort) */
-static int lock_graphics_clocks(int gfxclk) {
-    char arg[64];
-    snprintf(arg, sizeof(arg), "--lock-gpu-clocks=%d,%d", gfxclk, gfxclk);
-    char *argv[] = { nvsmipath, arg, NULL };
-    return run_nvsmicmd(argv);
-}
-
-/* reset graphics clocks (unlock) */
-static int reset_graphics_clocks(void) {
-    char *try1[] = { nvsmipath, "--reset-gpu-clocks", NULL };
-    if (run_nvsmicmd(try1) == 0) return 0;
-    /* fallback: some drivers use broader reset */
-    char *try2[] = { nvsmipath, "--reset-clocks", NULL };
-    return run_nvsmicmd(try2);
-}
-
-/* Print the profile result line.  Shows what was requested and what the driver
- * actually applied; adds a note if the driver adjusted either value. */
-static void print_profile_result(const char *label,
+/*
+ * print_profile_result — clean summary after a profile is applied.
+ * Shows requested vs. actual when the driver adjusted the values.
+ */
+static void print_profile_result(const char *profile_label,
                                   int req_mem,  int req_gfx,
-                                  int real_mem, int real_gfx) {
-    int mem = real_mem > 0 ? real_mem : req_mem;
-    int gfx = real_gfx > 0 ? real_gfx : req_gfx;
-    printf("%s: memory %d MHz, graphics %d MHz", label, mem, gfx);
+                                  int real_mem, int real_gfx,
+                                  int temp)
+{
+    printf("%s profile applied\n", profile_label);
+
     if (real_mem > 0 && real_mem != req_mem)
-        printf(" (memory requested %d MHz, driver applied %d MHz)", req_mem, real_mem);
+        printf("  Memory:   %d MHz  [driver adjusted from %d MHz]\n",
+               real_mem, req_mem);
+    else if (real_mem > 0)
+        printf("  Memory:   %d MHz\n", real_mem);
+    else
+        printf("  Memory:   %d MHz (readback unavailable)\n", req_mem);
+
     if (real_gfx > 0 && real_gfx != req_gfx)
-        printf(" (graphics requested %d MHz, driver applied %d MHz)", req_gfx, real_gfx);
-    printf("\n");
+        printf("  Graphics: %d MHz  [driver adjusted from %d MHz]\n",
+               real_gfx, req_gfx);
+    else if (real_gfx > 0)
+        printf("  Graphics: %d MHz\n", real_gfx);
+    else
+        printf("  Graphics: %d MHz (readback unavailable)\n", req_gfx);
+
+    if (temp > 0)
+        printf("  Temp:     %d°C\n", temp);
 }
 
-/* apply a profile: enable persistence, lock memory and graphics clocks */
-static int apply_profile(int memclk, int gfxclk) {
-    if (enable_persistence() != 0) {
-        fprintf(stderr, "Failed to enable persistence mode\n");
+/*
+ * check_temp_safety — refuse hot profiles at extreme temperatures.
+ * Returns 0 if safe to proceed, -1 if the profile should be blocked.
+ */
+static int check_temp_safety(int is_hot_profile)
+{
+    int temp = hw_gpu_temp();
+    if (temp < 0)
+        return 0;   /* can't read temp — proceed anyway */
+
+    if (temp >= TEMP_LIMIT_C && is_hot_profile) {
+        fprintf(stderr,
+                "nvflux: GPU at %d°C — refusing high-performance profile "
+                "(limit %d°C)\n", temp, TEMP_LIMIT_C);
         return -1;
     }
-    if (lock_memory_clocks(memclk) != 0) {
-        fprintf(stderr, "Failed to lock memory clocks to %d MHz\n", memclk);
-        return -1;
-    }
-    if (gfxclk > 0 && lock_graphics_clocks(gfxclk) != 0) {
-        fprintf(stderr, "Warning: could not lock graphics clocks to %d MHz (may require driver 510+)\n", gfxclk);
-    }
+    if (temp >= TEMP_WARN_C)
+        fprintf(stderr,
+                "nvflux: warning: GPU temperature is %d°C\n", temp);
     return 0;
 }
 
-/* check allowed */
-static int is_allowed(const char *cmd) {
-    for (int i = 0; allowed_cmds[i]; ++i) if (strcmp(cmd, allowed_cmds[i]) == 0) return 1;
-    return 0;
-}
-
-/* check NVIDIA driver/runtime status */
-static int check_nvidia_runtime(void) {
-    char out[READ_BUF];
-    char *argv[] = { nvsmipath, "--query-gpu=name", "--format=csv,noheader", NULL };
-    int rc = exec_capture(argv, out, sizeof(out), 1); /* capture stderr to detect driver errors */
-    if (rc < 0) {
-        /* exec failure / cannot run nvidia-smi */
-        fprintf(stderr, "Error: failed to execute %s. Is nvidia-smi available and executable?\n", nvsmipath);
-        return -1;
-    }
-    /* if output contains "No devices were found" or is empty -> driver not present/working */
-    if (out[0] == '\0' || strstr(out, "No devices were found")) {
-        fprintf(stderr, "Error: no NVIDIA GPUs detected or driver not loaded.\n");
-        fprintf(stderr, "Hint: install or enable the NVIDIA driver for your distro (see README).\n");
-        return -2;
-    }
-    return 0;
-}
-
-/* main entry (delegated from src/main.c) */
-int nvflux_run(int argc, char **argv) {
-    /* provide a helpful --help / -h from the privileged runner as well */
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <performance|balanced|powersaver|auto|reset|status|clock|--restore|--help>\n", argv[0]);
+/*
+ * apply_profile — core profile application logic.
+ *
+ *   mem_pct  — memory clock percentile (0=highest, 100=lowest)
+ *   gfx_pct  — graphics clock percentile after filtering
+ *   mode_str — identifier written to the state file
+ */
+static int apply_profile(int mem_pct, int gfx_pct, const char *mode_str,
+                          uid_t real_uid)
+{
+    /* 1. Memory clocks */
+    int mem_clocks[HW_MAX_CLOCKS];
+    int mem_n = hw_get_mem_clocks(mem_clocks, HW_MAX_CLOCKS);
+    if (mem_n <= 0) {
+        fprintf(stderr, "nvflux: failed to query memory clocks\n");
         return 1;
     }
-    if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
-        printf("nvflux - manage NVIDIA GPU profiles (safe, limited set of nvidia-smi ops)\n\n");
-        printf("Usage:\n");
-        printf("  nvflux <command>\n\n");
-        printf("Commands:\n");
-        printf("  performance     Lock GPU memory & graphics clocks to highest supported\n");
-        printf("  balanced        Lock GPU memory & graphics clocks to a mid value\n");
-        printf("  powersaver      Lock GPU memory & graphics clocks to lowest supported\n");
-        printf("  auto | reset    Reset all GPU clock locks to automatic behavior\n");
-        printf("  status          Show last saved profile for the calling user\n");
-        printf("  clock           Print current memory & graphics clocks (MHz)\n");
-        printf("  --restore       Reapply last saved profile for the calling user\n");
-        printf("  -h, --help      Show this help message\n\n");
-        printf("Notes:\n");
-        printf("  - nvflux is intended to be installed setuid root; installer script sets that up.\n");
-        printf("  - Only the above commands are allowed; nvflux validates inputs before running nvidia-smi.\n");
-        return 0;
+    int target_mem = pick_clock_at_pct(mem_clocks, mem_n, mem_pct);
+
+    /* 2. Graphics clocks for this memory level */
+    int gfx_clocks[HW_MAX_CLOCKS];
+    int gfx_n = hw_get_graphics_clocks(target_mem, gfx_clocks, HW_MAX_CLOCKS);
+    if (gfx_n <= 0) {
+        fprintf(stderr, "nvflux: failed to query graphics clocks\n");
+        return 1;
     }
 
-    if (find_nvidia_smi() < 0) {
-        fprintf(stderr, "Error: nvidia-smi not found in common locations or PATH.\n");
-        fprintf(stderr, "Hint: install NVIDIA drivers / nvidia-utils for your distro. See README.\n");
-        return 2;
+    /* 3. Strip boost clocks the driver can't actually lock */
+    int max_lockable = hw_get_max_lockable_gfx();
+    if (max_lockable > 0)
+        gfx_n = filter_lockable_clocks(gfx_clocks, gfx_n, max_lockable);
+    if (gfx_n <= 0) {
+        fprintf(stderr, "nvflux: no lockable graphics clocks available\n");
+        return 1;
     }
 
-    if (check_nvidia_runtime() != 0) {
-        /* check_nvidia_runtime already printed a helpful message */
-        return 3;
+    int target_gfx = pick_clock_at_pct(gfx_clocks, gfx_n, gfx_pct);
+
+    /* 4. Snapshot current clocks before locking */
+    int before_mem = hw_current_mem_clock();
+    int before_gfx = hw_current_graphics_clock();
+
+    /* 5. Apply */
+    hw_enable_persistence();
+
+    if (hw_lock_memory_clocks(target_mem, target_mem) < 0) {
+        fprintf(stderr, "nvflux: failed to lock memory clocks\n");
+        return 1;
+    }
+    if (hw_lock_graphics_clocks(target_gfx, target_gfx) < 0) {
+        fprintf(stderr, "nvflux: failed to lock graphics clocks\n");
+        return 1;
     }
 
-    uid_t real_uid = getuid();
-    uid_t effective_uid = geteuid();
+    /* 6. Wait for driver to settle */
+    int real_mem = -1, real_gfx = -1;
+    read_clocks_stable(before_mem, before_gfx, &real_mem, &real_gfx);
 
-    if (effective_uid != 0) {
-        fprintf(stderr, "Error: this program needs to be installed setuid root (installer will do this).\n");
-        return 4;
-    }
+    /* 7. Print clean summary */
+    int temp = hw_gpu_temp();
+    print_profile_result(mode_display_name(mode_str),
+                         target_mem, target_gfx,
+                         real_mem,   real_gfx,
+                         temp);
 
-    const char *cmd = argv[1];
-    if (!is_allowed(cmd)) {
-        fprintf(stderr, "Unknown or disallowed command: %s\n", cmd);
-        return 5;
-    }
-
-    if (strcmp(cmd, "status") == 0) {
-        char mode[128] = {0};
-        if (read_state(real_uid, mode, sizeof(mode))) {
-            if (mode[0] >= 'a' && mode[0] <= 'z') {
-                mode[0] = mode[0] - 'a' + 'A';
-            }
-            printf("%s\n", mode);
-        } else {
-            printf("Default\n");
-        }
-        return 0;
-    }
-
-    if (strcmp(cmd, "clock") == 0) {
-        int mem = get_current_mem_clock();
-        int gfx = get_current_graphics_clock();
-        if (mem < 0 && gfx < 0) {
-            fprintf(stderr, "Failed to query current clocks\n");
-            return 1;
-        }
-        if (mem >= 0) printf("Memory:   %d MHz\n", mem);
-        if (gfx >= 0) printf("Graphics: %d MHz\n", gfx);
-        return 0;
-    }
-
-    if (strcmp(cmd, "--restore") == 0) {
-        char mode[128] = {0};
-        if (!read_state(real_uid, mode, sizeof(mode))) {
-            fprintf(stderr, "No saved mode to restore\n");
-            return 1;
-        }
-        cmd = mode;
-    }
-
-    int mem_clocks[MAX_CLOCKS];
-    int mem_count = get_mem_clocks(mem_clocks, MAX_CLOCKS);
-    if (mem_count <= 0) { fprintf(stderr, "Failed to query supported memory clocks\n"); return 1; }
-
-    int mem_max = mem_clocks[0];
-    int mem_mid = mem_clocks[mem_count / 2];
-    int mem_low = mem_clocks[mem_count - 1];
-
-    /* max_lockable_gfx: the driver's actual ceiling for --lock-gpu-clocks.
-     * Queried once; used in every profile block to strip boost clocks. */
-    int max_lockable_gfx = get_max_lockable_gfx_clock();
-
-    if (strcmp(cmd, "performance") == 0) {
-        if (check_temp_safety(1) != 0) return 1;
-        int gfx_clocks[MAX_CLOCKS];
-        int gfx_count = get_graphics_clocks(mem_max, gfx_clocks, MAX_CLOCKS);
-        gfx_count = filter_lockable_clocks(gfx_clocks, gfx_count, max_lockable_gfx);
-        int gfx = pick_clock_at_pct(gfx_clocks, gfx_count, GFX_PCT_PERFORMANCE);
-        int before_mem = get_current_mem_clock();
-        int before_gfx = get_current_graphics_clock();
-        if (apply_profile(mem_max, gfx) != 0) return 1;
-        int real_mem, real_gfx;
-        read_clocks_stable(before_mem, before_gfx, &real_mem, &real_gfx);
-        print_profile_result("Performance", mem_max, gfx, real_mem, real_gfx);
-        write_state(real_uid, "performance");
-        return 0;
-    } else if (strcmp(cmd, "balanced") == 0) {
-        if (check_temp_safety(1) != 0) return 1;
-        int gfx_clocks[MAX_CLOCKS];
-        int gfx_count = get_graphics_clocks(mem_mid, gfx_clocks, MAX_CLOCKS);
-        gfx_count = filter_lockable_clocks(gfx_clocks, gfx_count, max_lockable_gfx);
-        int gfx = pick_clock_at_pct(gfx_clocks, gfx_count, GFX_PCT_BALANCED);
-        int before_mem = get_current_mem_clock();
-        int before_gfx = get_current_graphics_clock();
-        if (apply_profile(mem_mid, gfx) != 0) return 1;
-        int real_mem, real_gfx;
-        read_clocks_stable(before_mem, before_gfx, &real_mem, &real_gfx);
-        print_profile_result("Balanced", mem_mid, gfx, real_mem, real_gfx);
-        write_state(real_uid, "balanced");
-        return 0;
-    } else if (strcmp(cmd, "powersaver") == 0) {
-        if (check_temp_safety(0) != 0) return 1;
-        /* Query graphics for mem_low; if the driver clamps mem_low to a higher
-         * level (e.g. 405->810), the fallback inside get_graphics_clocks will
-         * return the full range, which is still correct for 810 MHz. */
-        int gfx_clocks[MAX_CLOCKS];
-        int gfx_count = get_graphics_clocks(mem_low, gfx_clocks, MAX_CLOCKS);
-        gfx_count = filter_lockable_clocks(gfx_clocks, gfx_count, max_lockable_gfx);
-        int gfx = pick_clock_at_pct(gfx_clocks, gfx_count, GFX_PCT_POWERSAVER);
-        int before_mem = get_current_mem_clock();
-        int before_gfx = get_current_graphics_clock();
-        if (apply_profile(mem_low, gfx) != 0) return 1;
-        int real_mem, real_gfx;
-        read_clocks_stable(before_mem, before_gfx, &real_mem, &real_gfx);
-        print_profile_result("Power Saver", mem_low, gfx, real_mem, real_gfx);
-        write_state(real_uid, "powersaver");
-        return 0;
-    } else if (strcmp(cmd, "auto") == 0 || strcmp(cmd, "reset") == 0) {
-        if (reset_memory_clocks() != 0) { fprintf(stderr, "Failed to reset memory clocks\n"); return 1; }
-        reset_graphics_clocks(); /* best-effort */
-        printf("Auto: clocks reset to driver-managed\n");
-        write_state(real_uid, "auto");
-        return 0;
-    }
+    /* 8. Persist state */
+    nvflux_state_t st;
+    memset(&st, 0, sizeof(st));
+    strncpy(st.mode, mode_str, sizeof(st.mode) - 1);
+    st.memory_mhz   = (real_mem  > 0) ? real_mem  : target_mem;
+    st.graphics_mhz = (real_gfx  > 0) ? real_gfx  : target_gfx;
+    st.temp_c       = (temp      > 0) ? temp       : 0;
+    state_write(real_uid, &st);
 
     return 0;
 }
+
+/*
+ * apply_clock — lock to explicit user-specified clock values.
+ */
+static int apply_clock(int req_mem, int req_gfx, uid_t real_uid)
+{
+    int before_mem = hw_current_mem_clock();
+    int before_gfx = hw_current_graphics_clock();
+
+    hw_enable_persistence();
+
+    if (hw_lock_memory_clocks(req_mem, req_mem) < 0) {
+        fprintf(stderr, "nvflux: failed to lock memory clocks\n");
+        return 1;
+    }
+    if (hw_lock_graphics_clocks(req_gfx, req_gfx) < 0) {
+        fprintf(stderr, "nvflux: failed to lock graphics clocks\n");
+        return 1;
+    }
+
+    int real_mem = -1, real_gfx = -1;
+    read_clocks_stable(before_mem, before_gfx, &real_mem, &real_gfx);
+
+    int temp = hw_gpu_temp();
+    print_profile_result("Custom Clock",
+                         req_mem, req_gfx,
+                         real_mem, real_gfx,
+                         temp);
+
+    nvflux_state_t st;
+    memset(&st, 0, sizeof(st));
+    strncpy(st.mode, "clock", sizeof(st.mode) - 1);
+    st.memory_mhz   = (real_mem > 0) ? real_mem : req_mem;
+    st.graphics_mhz = (real_gfx > 0) ? real_gfx : req_gfx;
+    st.temp_c       = (temp     > 0) ? temp      : 0;
+    state_write(real_uid, &st);
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Command handlers                                                   */
+/* ------------------------------------------------------------------ */
+
+static int cmd_performance(uid_t real_uid)
+{
+    if (check_temp_safety(1) < 0)
+        return 1;
+    return apply_profile(MEM_PCT_PERFORMANCE, GFX_PCT_PERFORMANCE,
+                         "performance", real_uid);
+}
+
+static int cmd_balanced(uid_t real_uid)
+{
+    if (check_temp_safety(1) < 0)
+        return 1;
+    return apply_profile(MEM_PCT_BALANCED, GFX_PCT_BALANCED,
+                         "balanced", real_uid);
+}
+
+static int cmd_powersave(uid_t real_uid)
+{
+    return apply_profile(MEM_PCT_POWERSAVE, GFX_PCT_POWERSAVE,
+                         "powersave", real_uid);
+}
+
+static int cmd_auto(uid_t real_uid)
+{
+    int temp = hw_gpu_temp();
+
+    if (temp < 0) {
+        fprintf(stderr,
+                "nvflux: auto: cannot read GPU temperature, "
+                "falling back to balanced\n");
+        return cmd_balanced(real_uid);
+    }
+
+    if (temp >= TEMP_WARN_C) {
+        printf("Auto: GPU at %d°C — selecting Power Save\n", temp);
+        return cmd_powersave(real_uid);
+    }
+    if (temp <= 60) {
+        printf("Auto: GPU at %d°C — selecting Performance\n", temp);
+        return cmd_performance(real_uid);
+    }
+    printf("Auto: GPU at %d°C — selecting Balanced\n", temp);
+    return cmd_balanced(real_uid);
+}
+
+static int cmd_reset(uid_t real_uid)
+{
+    hw_reset_memory_clocks();
+    hw_reset_graphics_clocks();
+    printf("Clock locks removed — GPU running at driver defaults\n");
+
+    nvflux_state_t st;
+    memset(&st, 0, sizeof(st));
+    strncpy(st.mode, "reset", sizeof(st.mode) - 1);
+    int temp = hw_gpu_temp();
+    st.temp_c = (temp > 0) ? temp : 0;
+    state_write(real_uid, &st);
+
+    return 0;
+}
+
+static int cmd_status(uid_t real_uid)
+{
+    nvflux_state_t st;
+    int have_state = (state_read(real_uid, &st) == 0);
+
+    int live_mem  = hw_current_mem_clock();
+    int live_gfx  = hw_current_graphics_clock();
+    int live_temp = hw_gpu_temp();
+
+    printf("─────────────────────────────\n");
+    if (have_state && st.mode[0] != '\0') {
+        printf("Profile:  %s\n", mode_display_name(st.mode));
+        if (st.timestamp[0] != '\0')
+            printf("Applied:  %s\n", st.timestamp);
+
+        if (st.memory_mhz > 0)
+            printf("Memory:   %d MHz", st.memory_mhz);
+        else
+            printf("Memory:   (unknown)");
+        if (live_mem > 0 && live_mem != st.memory_mhz)
+            printf("  (live: %d MHz)", live_mem);
+        else if (live_mem > 0 && st.memory_mhz <= 0)
+            printf("  live: %d MHz", live_mem);
+        putchar('\n');
+
+        if (st.graphics_mhz > 0)
+            printf("Graphics: %d MHz", st.graphics_mhz);
+        else
+            printf("Graphics: (unknown)");
+        if (live_gfx > 0 && live_gfx != st.graphics_mhz)
+            printf("  (live: %d MHz)", live_gfx);
+        else if (live_gfx > 0 && st.graphics_mhz <= 0)
+            printf("  live: %d MHz", live_gfx);
+        putchar('\n');
+
+        if (st.temp_c > 0) {
+            printf("Temp:     %d°C", st.temp_c);
+            if (live_temp > 0 && live_temp != st.temp_c)
+                printf("  (now: %d°C)", live_temp);
+            putchar('\n');
+        } else if (live_temp > 0) {
+            printf("Temp:     %d°C\n", live_temp);
+        }
+    } else {
+        printf("Profile:  none\n");
+        if (live_mem  > 0) printf("Memory:   %d MHz  (live)\n", live_mem);
+        if (live_gfx  > 0) printf("Graphics: %d MHz  (live)\n", live_gfx);
+        if (live_temp > 0) printf("Temp:     %d°C\n",           live_temp);
+    }
+    printf("─────────────────────────────\n");
+    return 0;
+}
+
+static int cmd_restore(uid_t real_uid)
+{
+    nvflux_state_t st;
+    if (state_read(real_uid, &st) < 0 || st.mode[0] == '\0') {
+        fprintf(stderr, "nvflux: --restore: no saved state found\n");
+        return 1;
+    }
+
+    if (strcmp(st.mode, "performance") == 0) return cmd_performance(real_uid);
+    if (strcmp(st.mode, "balanced")    == 0) return cmd_balanced(real_uid);
+    if (strcmp(st.mode, "powersave")   == 0) return cmd_powersave(real_uid);
+    if (strcmp(st.mode, "auto")        == 0) return cmd_auto(real_uid);
+    if (strcmp(st.mode, "reset")       == 0) return cmd_reset(real_uid);
+
+    if (strcmp(st.mode, "clock") == 0) {
+        if (st.memory_mhz <= 0 || st.graphics_mhz <= 0) {
+            fprintf(stderr,
+                    "nvflux: --restore: saved clock values are invalid\n");
+            return 1;
+        }
+        return apply_clock(st.memory_mhz, st.graphics_mhz, real_uid);
+    }
+
+    fprintf(stderr, "nvflux: --restore: unknown saved mode '%s'\n", st.mode);
+    return 1;
+}
+
+static int cmd_clock(int mem_mhz, int gfx_mhz, uid_t real_uid)
+{
+    if (check_temp_safety(1) < 0)
+        return 1;
+
+    int max_lockable = hw_get_max_lockable_gfx();
+    if (max_lockable > 0 && gfx_mhz > max_lockable) {
+        fprintf(stderr,
+                "nvflux: clock: requested graphics clock %d MHz exceeds "
+                "max lockable %d MHz — clamping\n", gfx_mhz, max_lockable);
+        gfx_mhz = max_lockable;
+    }
+
+    return apply_clock(mem_mhz, gfx_mhz, real_uid);
+}
+
+/* ------------------------------------------------------------------ */
+/*  nvflux_run — main entry point                                      */
+/* ------------------------------------------------------------------ */
+
+static void print_help(void)
+{
+    printf(
+        "Usage: nvflux <mode> [options]\n"
+        "\n"
+        "Modes:\n"
+        "  performance        Lock to highest memory clock; near-peak graphics\n"
+        "  balanced           Mid-range memory and graphics clocks\n"
+        "  powersave          Lowest memory clock; near-floor graphics\n"
+        "  auto               Choose profile automatically based on GPU temperature\n"
+        "  reset              Remove all clock locks (driver defaults)\n"
+        "  status             Show current profile, clocks, and temperature\n"
+        "  clock <mem> <gfx>  Lock to specific MHz values\n"
+        "\n"
+        "Service options:\n"
+        "  --restore          Re-apply the last saved profile (for system services)\n"
+        "\n"
+        "Other options:\n"
+        "  --help, -h         Show this help\n"
+        "  --version, -v      Show version\n"
+    );
+}
+
+int nvflux_run(int argc, char **argv)
+{
+    if (argc < 2) {
+        print_help();
+        return 1;
+    }
+
+    if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
+        print_help();
+        return 0;
+    }
+
+    const char *mode = argv[1];
+
+    /* Validate mode before anything else */
+    static const char * const allowed[] = {
+        "performance", "balanced", "powersave",
+        "auto", "reset", "status", "clock", "--restore",
+        NULL
+    };
+    int valid = 0;
+    for (int i = 0; allowed[i]; i++)
+        if (strcmp(mode, allowed[i]) == 0) { valid = 1; break; }
+
+    if (!valid) {
+        fprintf(stderr, "nvflux: unknown mode '%s'\n", mode);
+        fprintf(stderr, "Run 'nvflux --help' for usage.\n");
+        return 1;
+    }
+
+    /* Capture the real (non-escalated) user now */
+    uid_t real_uid = getuid();
+
+    /* status can run without hardware checks */
+    if (strcmp(mode, "status") == 0)
+        return cmd_status(real_uid);
+
+    if (hw_check_runtime() < 0)
+        return 1;
+
+    if (strcmp(mode, "performance") == 0) return cmd_performance(real_uid);
+    if (strcmp(mode, "balanced")    == 0) return cmd_balanced(real_uid);
+    if (strcmp(mode, "powersave")   == 0) return cmd_powersave(real_uid);
+    if (strcmp(mode, "auto")        == 0) return cmd_auto(real_uid);
+    if (strcmp(mode, "reset")       == 0) return cmd_reset(real_uid);
+    if (strcmp(mode, "--restore")   == 0) return cmd_restore(real_uid);
+
+    if (strcmp(mode, "clock") == 0) {
+        if (argc < 4) {
+            fprintf(stderr,
+                    "nvflux: clock mode requires two arguments: "
+                    "<memory_mhz> <graphics_mhz>\n");
+            return 1;
+        }
+        int mem_mhz = atoi(argv[2]);
+        int gfx_mhz = atoi(argv[3]);
+        if (mem_mhz <= 0 || gfx_mhz <= 0) {
+            fprintf(stderr,
+                    "nvflux: clock: invalid values %s / %s\n",
+                    argv[2], argv[3]);
+            return 1;
+        }
+        return cmd_clock(mem_mhz, gfx_mhz, real_uid);
+    }
+
+    /* unreachable — already validated above */
+    return 1;
+}
+

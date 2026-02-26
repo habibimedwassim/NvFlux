@@ -17,6 +17,8 @@ include_directories(include)
 add_executable(nvflux 
     src/main.c
     src/nvflux.c
+    src/hw.c
+    src/state.c
 )
 target_compile_definitions(nvflux PRIVATE NVFLUX_VERSION="${PROJECT_VERSION}")
 
@@ -29,6 +31,8 @@ if(BUILD_TESTS)
     add_executable(test_nvflux 
         tests/test_nvflux.c 
         src/nvflux.c
+        src/hw.c
+        src/state.c
     )
     target_include_directories(test_nvflux PRIVATE include)
     
