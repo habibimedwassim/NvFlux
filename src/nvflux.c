@@ -21,6 +21,17 @@
 #define GFX_PCT_BALANCED    50   /* middle:      ~50th pct by frequency  */
 #define GFX_PCT_POWERSAVER  95   /* near bottom: ~5th  pct by frequency  */
 
+/* Temperature thresholds (degrees Celsius).
+ * At WARN, the user is notified but the profile is still applied.
+ * At LIMIT, applying a hotter profile (performance/balanced) is refused. */
+#define TEMP_WARN_C   80
+#define TEMP_LIMIT_C  90
+
+/* How long to wait for the driver to settle after locking clocks.
+ * Polls every READBACK_POLL_MS up to READBACK_TIMEOUT_MS total. */
+#define READBACK_POLL_MS     100
+#define READBACK_TIMEOUT_MS  2000
+
 /* allowed commands */
 static const char *allowed_cmds[] = {
     "performance", "balanced", "powersaver", "auto", "reset", "status", "clock", "--restore", NULL
@@ -296,6 +307,60 @@ static int get_current_graphics_clock(void) {
     return -1;
 }
 
+/* query GPU temperature in degrees Celsius; returns -1 on failure */
+static int get_gpu_temp(void) {
+    char out[READ_BUF];
+    char *argv[] = { nvsmipath, "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits", NULL };
+    if (exec_capture(argv, out, sizeof(out), 0) < 0) return -1;
+    const char *p = out;
+    while (*p && (*p < '0' || *p > '9')) p++;
+    if (!*p) return -1;
+    return (int)strtol(p, NULL, 10);
+}
+
+/* Poll until two consecutive clock reads agree (driver has settled) or timeout.
+ * Returns the stabilised mem and gfx clocks via out-params. */
+static void read_clocks_stable(int *out_mem, int *out_gfx) {
+    int prev_mem = -1, prev_gfx = -1;
+    int elapsed = 0;
+    while (elapsed < READBACK_TIMEOUT_MS) {
+        int mem = get_current_mem_clock();
+        int gfx = get_current_graphics_clock();
+        if (mem == prev_mem && gfx == prev_gfx && mem > 0) {
+            *out_mem = mem;
+            *out_gfx = gfx;
+            return;
+        }
+        prev_mem = mem;
+        prev_gfx = gfx;
+        usleep(READBACK_POLL_MS * 1000);
+        elapsed += READBACK_POLL_MS;
+    }
+    /* timeout: return whatever we last read */
+    *out_mem = prev_mem;
+    *out_gfx = prev_gfx;
+}
+
+/* Check GPU temperature and refuse or warn before applying a profile.
+ * hot_profile: 1 if this is performance/balanced (higher load); 0 for powersaver. */
+static int check_temp_safety(int hot_profile) {
+    int temp = get_gpu_temp();
+    if (temp < 0) return 0; /* can't read temp, allow */
+    if (hot_profile && temp >= TEMP_LIMIT_C) {
+        fprintf(stderr,
+            "Error: GPU temperature is %d°C (>= %d°C limit).\n"
+            "       Cool down the GPU before applying a high-performance profile.\n",
+            temp, TEMP_LIMIT_C);
+        return -1;
+    }
+    if (temp >= TEMP_WARN_C) {
+        fprintf(stderr,
+            "Warning: GPU temperature is %d°C (>= %d°C threshold). "
+            "Monitor thermals.\n", temp, TEMP_WARN_C);
+    }
+    return 0;
+}
+
 /* lock graphics clocks to gfxclk (best-effort) */
 static int lock_graphics_clocks(int gfxclk) {
     char arg[64];
@@ -453,30 +518,33 @@ int nvflux_run(int argc, char **argv) {
     int gfx_count = get_graphics_clocks(gfx_clocks, MAX_CLOCKS);
 
     if (strcmp(cmd, "performance") == 0) {
+        if (check_temp_safety(1) != 0) return 1;
         int gfx = pick_clock_at_pct(gfx_clocks, gfx_count, GFX_PCT_PERFORMANCE);
         if (apply_profile(mem_max, gfx) != 0) return 1;
-        int real_mem = get_current_mem_clock();
-        int real_gfx = get_current_graphics_clock();
+        int real_mem, real_gfx;
+        read_clocks_stable(&real_mem, &real_gfx);
         printf("Performance: memory %d MHz, graphics %d MHz\n",
                real_mem > 0 ? real_mem : mem_max,
                real_gfx > 0 ? real_gfx : gfx);
         write_state(real_uid, "performance");
         return 0;
     } else if (strcmp(cmd, "balanced") == 0) {
+        if (check_temp_safety(1) != 0) return 1;
         int gfx = pick_clock_at_pct(gfx_clocks, gfx_count, GFX_PCT_BALANCED);
         if (apply_profile(mem_mid, gfx) != 0) return 1;
-        int real_mem = get_current_mem_clock();
-        int real_gfx = get_current_graphics_clock();
+        int real_mem, real_gfx;
+        read_clocks_stable(&real_mem, &real_gfx);
         printf("Balanced: memory %d MHz, graphics %d MHz\n",
                real_mem > 0 ? real_mem : mem_mid,
                real_gfx > 0 ? real_gfx : gfx);
         write_state(real_uid, "balanced");
         return 0;
     } else if (strcmp(cmd, "powersaver") == 0) {
+        if (check_temp_safety(0) != 0) return 1;
         int gfx = pick_clock_at_pct(gfx_clocks, gfx_count, GFX_PCT_POWERSAVER);
         if (apply_profile(mem_low, gfx) != 0) return 1;
-        int real_mem = get_current_mem_clock();
-        int real_gfx = get_current_graphics_clock();
+        int real_mem, real_gfx;
+        read_clocks_stable(&real_mem, &real_gfx);
         printf("Power Saver: memory %d MHz, graphics %d MHz\n",
                real_mem > 0 ? real_mem : mem_low,
                real_gfx > 0 ? real_gfx : gfx);
