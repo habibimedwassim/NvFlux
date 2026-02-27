@@ -7,7 +7,7 @@
 #ifndef NVFLUX_H
 #define NVFLUX_H
 
-#define NVFLUX_VERSION "1.0.0"
+#define NVFLUX_VERSION "1.1.0"
 
 /*
  * nvflux_run - process argv and execute the requested command.

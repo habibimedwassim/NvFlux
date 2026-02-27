@@ -13,11 +13,12 @@ else
     echo "Error: install rofi or dmenu." >&2; exit 1
 fi
 
-choice=$(printf "Performance\nBalanced\nPower Save\nAuto" | $MENU) || exit 0
+choice=$(printf "Ultra\nPerformance\nBalanced\nPower Save\nAuto" | $MENU) || exit 0
 
 notify() { command -v notify-send >/dev/null 2>&1 && notify-send "nvflux" "$1" || true; }
 
 case "$choice" in
+    "Ultra")       nvflux ultra       && notify "Ultra"       ;;
     "Performance") nvflux performance && notify "Performance" ;;
     "Balanced")    nvflux balanced    && notify "Balanced"    ;;
     "Power Save")  nvflux powersave   && notify "Power Save"  ;;

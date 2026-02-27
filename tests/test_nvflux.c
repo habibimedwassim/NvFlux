@@ -85,6 +85,15 @@ static void test_parse_clocks(void) {
 static void test_state_roundtrip(void) {
     uid_t uid = getuid();
 
+    /* write "ultra", read it back */
+    state_write(uid, "ultra");
+    {
+        char buf[NVFLUX_STATE_MAX] = {0};
+        int ok = state_read(uid, buf, sizeof(buf));
+        check(ok == 1,                      "state: read returns 1");
+        check(strcmp(buf, "ultra") == 0,    "state: value == 'ultra'");
+    }
+
     /* write "performance", read it back */
     state_write(uid, "performance");
     {

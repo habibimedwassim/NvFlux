@@ -7,7 +7,7 @@
 #ifndef NVFLUX_GPU_H
 #define NVFLUX_GPU_H
 
-#define GPU_MAX_CLOCKS 128
+#define GPU_MAX_CLOCKS 256
 
 /*
  * gpu_find_smi - locate nvidia-smi binary.
@@ -51,9 +51,29 @@ int gpu_lock_mem(int mhz);
 
 /*
  * gpu_unlock_mem - remove memory clock lock; driver resumes auto management.
- * Tries multiple option names for compatibility across driver versions.
  * Returns 0 on success, non-zero on failure.
  */
 int gpu_unlock_mem(void);
+
+/*
+ * gpu_gpu_clocks - query supported graphics (core) clock values from the driver.
+ * Fills clocks[] sorted descending.  Returns the number of values, or -1 on error.
+ */
+int gpu_gpu_clocks(int *clocks, int max);
+
+/*
+ * gpu_lock_gpu - lock the GPU core clock to exactly mhz MHz.
+ * Uses --lock-gpu-clocks (-lgc).  Returns 0 on success, non-zero on failure.
+ */
+int gpu_lock_gpu(int mhz);
+
+/*
+ * gpu_unlock_gpu - remove the GPU core clock lock (--reset-gpu-clocks / -rgc).
+ * This is the nvidia-smi equivalent of PowerMizer "Adaptive" mode.
+ * Called by all profiles except 'ultra' to ensure any pre-existing core lock
+ * (e.g. left by a previous 'ultra' run) is always cleared.
+ * Returns 0 on success, non-zero on failure.
+ */
+int gpu_unlock_gpu(void);
 
 #endif /* NVFLUX_GPU_H */

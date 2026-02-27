@@ -8,11 +8,13 @@ _nvflux() {
     local -a commands
 
     commands=(
+        'ultra:Lock GPU core + memory to max clocks (PowerMizer: Prefer Max Performance)'
         'performance:Lock memory clock to the highest supported tier'
         'balanced:Lock memory clock to the mid-range tier'
         'powersave:Lock memory clock to the lowest supported tier'
-        'auto:Unlock memory clocks (let the driver manage frequency)'
-        'status:Show the current lock state and last saved profile'
+        'auto:Unlock all clocks (driver-managed, PowerMizer: Adaptive)'
+        'status:Show last saved profile (no root needed)'
+        'clock:Print current memory clock in MHz'
         '--restore:Re-apply the last saved profile'
         '--version:Print version and exit'
         '--help:Print usage information and exit'

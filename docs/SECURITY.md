@@ -17,5 +17,8 @@ sudo chmod 4750       /usr/local/bin/nvflux
 
 ## Known Limitations
 
+- `ultra` and `auto` affect both GPU core and memory clocks; `performance`,
+  `balanced`, and `powersave` touch only memory clocks (GPU core is left in
+  whatever state the driver has it in).
 - Applies to all GPUs (nvidia-smi default). Multi-GPU targeting is a possible future addition.
 - No rate limiting on calls from the same user.

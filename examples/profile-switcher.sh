@@ -8,22 +8,24 @@ printf "Current profile : %s\n" "$(nvflux status)"
 printf "Current mem clock: %s\n\n" "$(nvflux clock)"
 
 cat <<'EOF'
-  1) Performance  (highest clock tier)
-  2) Balanced     (mid clock tier)
-  3) Power Save   (lowest clock tier)
-  4) Auto         (unlock, driver managed)
-  5) Exit
+  1) Ultra        (GPU + memory at max clocks — PowerMizer: Prefer Max Performance)
+  2) Performance  (memory highest tier, GPU clock untouched)
+  3) Balanced     (memory mid tier, GPU clock untouched)
+  4) Power Save   (memory lowest tier, GPU clock untouched)
+  5) Auto         (unlock all clocks — PowerMizer: Adaptive)
+  6) Exit
 EOF
 
-printf "\nChoice [1-5]: "
+printf "\nChoice [1-6]: "
 read -r choice
 
 case "$choice" in
-    1) nvflux performance ;;
-    2) nvflux balanced    ;;
-    3) nvflux powersave   ;;
-    4) nvflux auto        ;;
-    5) exit 0             ;;
+    1) nvflux ultra       ;;
+    2) nvflux performance ;;
+    3) nvflux balanced    ;;
+    4) nvflux powersave   ;;
+    5) nvflux auto        ;;
+    6) exit 0             ;;
     *) echo "Invalid choice." >&2; exit 1 ;;
 esac
 

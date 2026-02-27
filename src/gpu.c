@@ -168,9 +168,54 @@ int gpu_lock_mem(int mhz) {
 }
 
 int gpu_unlock_mem(void) {
-    /* The flag name differs between older and newer driver branches. */
+    /* Try the long form first (all drivers ≥ R384), then the short alias. */
     char *try1[] = { g_nvsmi, "--reset-memory-clocks", NULL };
-    char *try2[] = { g_nvsmi, "--reset-locks",         NULL };
+    char *try2[] = { g_nvsmi, "-rmc",                   NULL };
+    if (run_cmd(try1) == 0) return 0;
+    return run_cmd(try2);
+}
+
+int gpu_gpu_clocks(int *clocks, int max) {
+    char out[READ_BUF];
+    char *argv[] = {
+        g_nvsmi,
+        "--query-supported-clocks=graphics",
+        "--format=csv,noheader,nounits",
+        NULL
+    };
+    if (exec_capture(argv, out, sizeof(out)) < 0) return -1;
+
+    int n = 0;
+    const char *p = out;
+    while (*p && n < max) {
+        while (*p && !isdigit((unsigned char)*p)) p++;
+        if (!*p) break;
+        clocks[n++] = (int)strtol(p, (char **)&p, 10);
+    }
+
+    /* sort descending */
+    for (int i = 0; i < n; ++i) {
+        int best = i;
+        for (int j = i + 1; j < n; ++j)
+            if (clocks[j] > clocks[best]) best = j;
+        if (best != i) { int t = clocks[i]; clocks[i] = clocks[best]; clocks[best] = t; }
+    }
+    return n;
+}
+
+int gpu_lock_gpu(int mhz) {
+    char arg[64];
+    /* --lock-gpu-clocks (-lgc) expects "min,max"; equal values lock exactly. */
+    snprintf(arg, sizeof(arg), "--lock-gpu-clocks=%d,%d", mhz, mhz);
+    char *argv[] = { g_nvsmi, arg, NULL };
+    return run_cmd(argv);
+}
+
+int gpu_unlock_gpu(void) {
+    /* --reset-gpu-clocks (-rgc): resets GPU core clocks to driver defaults.
+     * This is the nvidia-smi equivalent of PowerMizer "Adaptive" mode. */
+    char *try1[] = { g_nvsmi, "--reset-gpu-clocks", NULL };
+    char *try2[] = { g_nvsmi, "-rgc",               NULL };
     if (run_cmd(try1) == 0) return 0;
     return run_cmd(try2);
 }

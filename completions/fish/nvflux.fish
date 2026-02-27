@@ -7,9 +7,14 @@
 complete -c nvflux -f
 
 # Helper: true when no subcommand has been given yet
-set -l __nvflux_cmds performance balanced powersave auto status
+set -l __nvflux_cmds ultra performance balanced powersave auto status clock
 
 # ── Subcommands ────────────────────────────────────────────────────────────────
+complete -c nvflux \
+    -n "not __fish_seen_subcommand_from $__nvflux_cmds" \
+    -a ultra \
+    -d 'Lock GPU core + memory to max clocks (PowerMizer: Prefer Max Performance)'
+
 complete -c nvflux \
     -n "not __fish_seen_subcommand_from $__nvflux_cmds" \
     -a performance \
@@ -28,12 +33,17 @@ complete -c nvflux \
 complete -c nvflux \
     -n "not __fish_seen_subcommand_from $__nvflux_cmds" \
     -a auto \
-    -d 'Unlock memory clocks (driver-managed frequency)'
+    -d 'Unlock all clocks (driver-managed, PowerMizer: Adaptive)'
 
 complete -c nvflux \
     -n "not __fish_seen_subcommand_from $__nvflux_cmds" \
     -a status \
-    -d 'Show current lock state and last saved profile'
+    -d 'Show last saved profile (no root needed)'
+
+complete -c nvflux \
+    -n "not __fish_seen_subcommand_from $__nvflux_cmds" \
+    -a clock \
+    -d 'Print current memory clock in MHz'
 
 # ── Flags ──────────────────────────────────────────────────────────────────────
 complete -c nvflux \

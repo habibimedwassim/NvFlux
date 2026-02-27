@@ -21,7 +21,7 @@ _nvflux()
         return 0
     fi
 
-    local commands="performance balanced powersave auto status --restore --version --help"
+    local commands="ultra performance balanced powersave auto status clock --restore --version --help"
     COMPREPLY=( $(compgen -W "${commands}" -- "${cur}") )
     return 0
 }

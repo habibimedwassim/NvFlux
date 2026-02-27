@@ -1,29 +1,40 @@
 .\" nvflux(1)
-.TH NVFLUX 1 "February 2026" "nvflux 1.0.0" "User Commands"
+.TH NVFLUX 1 "February 2026" "nvflux 1.1.0" "User Commands"
 .SH NAME
-nvflux \- NVIDIA GPU memory clock lock
+nvflux \- NVIDIA GPU clock profile manager
 .SH SYNOPSIS
 .B nvflux
 .RI [ COMMAND ]
 .SH DESCRIPTION
 .B nvflux
-is a small setuid-root helper that lets unprivileged users lock NVIDIA GPU
-memory clocks via
+is a small setuid-root helper that lets unprivileged users manage NVIDIA GPU
+clock profiles via
 .BR nvidia-smi (1).
 Clock tiers are queried live from the driver; no values are hard-coded.
+All profiles work on Wayland and on driver versions \(<=\&580 where the
+nvidia-settings PowerMizer dropdown is unavailable.
 .SH COMMANDS
 .TP
+.B ultra
+Lock both the GPU core clock and memory clock to their maximum supported tiers.
+Equivalent to PowerMizer \(lqPrefer Maximum Performance\(rq.
+Use this for gaming or compute workloads where maximum throughput is needed.
+.TP
 .B performance
-Lock memory to the highest supported clock tier.
+Lock memory clock to the highest supported tier.
+The GPU core clock lock is reset to driver-managed (Adaptive).
 .TP
 .B balanced
-Lock memory to the mid-range supported clock tier.
+Lock memory clock to the mid-range supported tier.
+The GPU core clock lock is reset to driver-managed (Adaptive).
 .TP
 .B powersave
-Lock memory to the lowest supported clock tier.
+Lock memory clock to the lowest supported tier.
+The GPU core clock lock is reset to driver-managed (Adaptive).
 .TP
 .B auto
-Unlock memory clocks; the driver manages them automatically.
+Unlock all clocks; the driver manages both memory and GPU core clocks automatically.
+Equivalent to PowerMizer \(lqAdaptive\(rq.
 .TP
 .B status
 Print the last saved profile for the calling user.

@@ -26,11 +26,22 @@
 /* -----------------------------------------------------------------------
  * Profile table
  *
- * clock_tier: index semantics into the sorted-descending clock array
- *   0  = highest tier  (performance)
- *   1  = mid tier      (balanced)    → index count/2
- *   2  = lowest tier   (powersave)   → index count-1
- *  -1  = unlock        (auto)
+ * clock_tier / gpu_clock_tier: index semantics into the sorted-descending
+ * clock arrays for memory and graphics respectively.
+ *   0   = highest tier  (lock to max)
+ *   1   = mid tier      (lock to index count/2)
+ *   2   = lowest tier   (lock to index count-1)
+ *  -1   = unlock        (reset to driver-managed)
+ *
+ * PowerMizer equivalents (nvidia-settings GPUPowerMizerMode):
+ *   ultra       → Prefer Maximum Performance  (lock GPU + mem to max)
+ *   performance → memory-only max lock        (GPU core reset to Adaptive)
+ *   balanced    → memory-only mid lock        (GPU core reset to Adaptive)
+ *   powersave   → memory-only min lock        (GPU core reset to Adaptive)
+ *   auto        → Adaptive                    (unlock all, driver-managed)
+ *
+ * Using nvidia-smi directly means PowerMizer works on Wayland and on
+ * older drivers (≤ 580) where the nvidia-settings dropdown is broken.
  *
  * persist: whether to enable persistence mode before locking.
  *   Only needed when actually locking clocks; not needed for unlock.
@@ -38,16 +49,18 @@
 
 typedef struct {
     const char *name;
-    int clock_tier;
+    int clock_tier;      /* memory clock tier */
+    int gpu_clock_tier;  /* graphics/core clock tier */
     int persist;
 } Profile;
 
 static const Profile profiles[] = {
-    { "performance",  0,  1 },
-    { "balanced",     1,  1 },
-    { "powersave",    2,  1 },
-    { "auto",        -1,  0 },
-    { NULL, 0, 0 }
+    { "ultra",        0,  0, 1 },   /* lock both GPU + mem to max (PowerMizer: Prefer Max) */
+    { "performance",  0, -1, 1 },   /* lock mem to max, reset GPU core to Adaptive        */
+    { "balanced",     1, -1, 1 },   /* lock mem to mid, reset GPU core to Adaptive        */
+    { "powersave",    2, -1, 1 },   /* lock mem to min, reset GPU core to Adaptive        */
+    { "auto",        -1, -1, 0 },   /* unlock all clocks (PowerMizer: Adaptive)           */
+    { NULL, 0, 0, 0 }
 };
 
 /* -----------------------------------------------------------------------
@@ -78,14 +91,17 @@ int nvflux_parse_clocks(const char *txt, int *clocks, int max) {
 
 static void print_help(const char *prog) {
     printf(
-        "nvflux %s — NVIDIA GPU memory clock lock\n\n"
+        "nvflux %s — NVIDIA GPU clock profile manager\n\n"
         "Usage:\n"
         "  %s <command>\n\n"
         "Commands:\n"
-        "  performance    Lock memory to the highest supported clock tier\n"
-        "  balanced       Lock memory to the mid-range supported clock tier\n"
-        "  powersave      Lock memory to the lowest supported clock tier\n"
-        "  auto           Unlock memory clocks (driver managed)\n"
+        "  ultra          Lock GPU core + memory to maximum clocks\n"
+        "                 (equivalent to PowerMizer: Prefer Maximum Performance)\n"
+        "  performance    Lock memory to the highest supported tier; reset GPU core clock\n"
+        "  balanced       Lock memory to the mid-range supported tier; reset GPU core clock\n"
+        "  powersave      Lock memory to the lowest supported tier; reset GPU core clock\n"
+        "  auto           Unlock all clocks (driver-managed)\n"
+        "                 (equivalent to PowerMizer: Adaptive)\n"
         "  status         Print the last saved profile for this user\n"
         "  clock          Print the current memory clock in MHz\n"
         "  --restore      Re-apply the last saved profile\n"
@@ -93,7 +109,10 @@ static void print_help(const char *prog) {
         "  -h, --help     Print this help and exit\n\n"
         "Notes:\n"
         "  nvflux must be installed setuid root (scripts/install.sh handles this).\n"
-        "  Clock tiers are queried live from the driver; no values are hard-coded.\n",
+        "  Clock tiers are queried live from the driver; no values are hard-coded.\n"
+        "  'ultra' sets both GPU core and memory clocks via nvidia-smi, replicating\n"
+        "  PowerMizer behaviour on Wayland and drivers where the nvidia-settings\n"
+        "  PowerMizer dropdown is unavailable (≤ 580).\n",
         NVFLUX_VERSION, prog);
 }
 
@@ -193,17 +212,26 @@ int nvflux_run(int argc, char **argv) {
     }
 
     /* Query supported clock tiers (only needed when locking) */
-    int clocks[GPU_MAX_CLOCKS];
-    int count = 0;
+    int mem_clocks[GPU_MAX_CLOCKS];
+    int gpu_clocks[GPU_MAX_CLOCKS];
+    int mem_count = 0;
+    int gpu_count = 0;
     if (profile->clock_tier >= 0) {
-        count = gpu_mem_clocks(clocks, GPU_MAX_CLOCKS);
-        if (count <= 0) {
+        mem_count = gpu_mem_clocks(mem_clocks, GPU_MAX_CLOCKS);
+        if (mem_count <= 0) {
             fprintf(stderr, "Error: failed to query supported memory clocks.\n");
             return 1;
         }
     }
+    if (profile->gpu_clock_tier >= 0) {  /* only query when actually locking */
+        gpu_count = gpu_gpu_clocks(gpu_clocks, GPU_MAX_CLOCKS);
+        if (gpu_count <= 0) {
+            fprintf(stderr, "Error: failed to query supported GPU clocks.\n");
+            return 1;
+        }
+    }
 
-    /* 1. Enable persistence mode so the lock survives driver power-state
+    /* 1. Enable persistence mode so locks survive driver power-state
      *    transitions (e.g. GPU going idle between commands). */
     if (profile->persist) {
         if (gpu_enable_persistence() != 0) {
@@ -212,27 +240,49 @@ int nvflux_run(int argc, char **argv) {
         }
     }
 
-    /* 2. Apply clock lock or unlock */
+    /* 2a. Apply memory clock lock or unlock */
     if (profile->clock_tier < 0) {
-        /* auto: remove lock entirely */
+        /* auto: remove memory lock */
         if (gpu_unlock_mem() != 0) {
             fprintf(stderr, "Error: failed to unlock memory clocks.\n");
             return 1;
         }
     } else {
         /* Resolve tier index into the sorted clock array:
-         *   tier 0 (performance) → index 0         (highest)
-         *   tier 1 (balanced)    → index count/2   (middle)
-         *   tier 2 (powersave)   → index count-1   (lowest) */
+         *   tier 0 (performance) → index 0              (highest)
+         *   tier 1 (balanced)    → index mem_count/2    (middle)
+         *   tier 2 (powersave)   → index mem_count-1    (lowest) */
         int idx = (profile->clock_tier == 0) ? 0
-                : (profile->clock_tier == 2) ? count - 1
-                : count / 2;
-        int mhz = clocks[idx];
+                : (profile->clock_tier == 2) ? mem_count - 1
+                : mem_count / 2;
+        int mhz = mem_clocks[idx];
         if (gpu_lock_mem(mhz) != 0) {
             fprintf(stderr, "Error: failed to lock memory clock to %d MHz.\n", mhz);
             return 1;
         }
         printf("Memory clock locked to %d MHz (%s).\n", mhz, profile->name);
+    }
+
+    /* 2b. Apply GPU core clock lock or unlock (PowerMizer equivalent).
+     *     All profiles either lock to a tier or reset to Adaptive —
+     *     no profile leaves a pre-existing GPU lock in place, so switching
+     *     from 'ultra' to any other mode always clears the core lock. */
+    if (profile->gpu_clock_tier < 0) {
+        /* unlock: reset GPU core → Adaptive PowerMizer */
+        if (gpu_unlock_gpu() != 0) {
+            fprintf(stderr, "Error: failed to unlock GPU clocks.\n");
+            return 1;
+        }
+    } else {
+        int idx = (profile->gpu_clock_tier == 0) ? 0
+                : (profile->gpu_clock_tier == 2) ? gpu_count - 1
+                : gpu_count / 2;
+        int mhz = gpu_clocks[idx];
+        if (gpu_lock_gpu(mhz) != 0) {
+            fprintf(stderr, "Error: failed to lock GPU clock to %d MHz.\n", mhz);
+            return 1;
+        }
+        printf("GPU clock locked to %d MHz (%s).\n", mhz, profile->name);
     }
 
     /* 3. Save profile for future --restore / status */
