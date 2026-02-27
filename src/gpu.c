@@ -109,7 +109,8 @@ int gpu_mem_clocks(int *clocks, int max) {
         "--format=csv,noheader,nounits",
         NULL
     };
-    if (exec_capture(argv, out, sizeof(out)) < 0) return -1;
+    /* nvidia-smi returns 0 on success; any non-zero exit is an error */
+    if (exec_capture(argv, out, sizeof(out)) != 0) return -1;
 
     /* parse all integers from the output */
     int n = 0;
@@ -160,19 +161,49 @@ int gpu_enable_persistence(void) {
 
 int gpu_lock_mem(int mhz) {
     char arg[64];
-    /* nvidia-smi --lock-memory-clocks expects "min,max"; setting both to
-     * the same value locks to exactly that frequency. */
+    /* nvidia-smi --lock-memory-clocks (-lmc) expects "min,max"; equal values
+     * lock to exactly that frequency. Supported on Volta+.
+     *
+     * IMPORTANT: -lmc does NOT work on Hopper (H100) and newer datacenter
+     * architectures. For those, we fall back to --lock-memory-clocks-deferred
+     * (-lmcd), which takes effect after the next driver (re)initialisation.
+     * The caller receives a warning so the user can reload the kernel module. */
     snprintf(arg, sizeof(arg), "--lock-memory-clocks=%d,%d", mhz, mhz);
-    char *argv[] = { g_nvsmi, arg, NULL };
-    return run_cmd(argv);
+    char *immarg[] = { g_nvsmi, arg, NULL };
+    if (run_cmd(immarg) == 0) return 0;
+
+    /* Fallback: deferred lock (Hopper / future architectures) */
+    char darg[64];
+    snprintf(darg, sizeof(darg), "--lock-memory-clocks-deferred=%d", mhz);
+    char *defarg[] = { g_nvsmi, darg, NULL };
+    if (run_cmd(defarg) == 0) {
+        fprintf(stderr,
+            "Warning: immediate memory clock lock is unsupported on this GPU\n"
+            "         (Hopper / newer architecture detected).\n"
+            "         Deferred lock applied — reload the NVIDIA kernel module\n"
+            "         to activate: sudo rmmod nvidia && sudo modprobe nvidia\n");
+        return 0;
+    }
+    return -1;
 }
 
 int gpu_unlock_mem(void) {
-    /* Try the long form first (all drivers ≥ R384), then the short alias. */
+    /* Try the long form first (all drivers ≥ R384), then the short alias.
+     * If both fail (Hopper / newer arch), try the deferred reset variant.  */
     char *try1[] = { g_nvsmi, "--reset-memory-clocks", NULL };
     char *try2[] = { g_nvsmi, "-rmc",                   NULL };
+    char *try3[] = { g_nvsmi, "--reset-memory-clocks-deferred", NULL };
+    char *try4[] = { g_nvsmi, "-rmcd",                          NULL };
     if (run_cmd(try1) == 0) return 0;
-    return run_cmd(try2);
+    if (run_cmd(try2) == 0) return 0;
+    if (run_cmd(try3) == 0) {
+        fprintf(stderr,
+            "Warning: deferred memory clock reset applied (Hopper / newer arch).\n"
+            "         Reload the NVIDIA kernel module to activate:\n"
+            "         sudo rmmod nvidia && sudo modprobe nvidia\n");
+        return 0;
+    }
+    return run_cmd(try4);
 }
 
 int gpu_gpu_clocks(int *clocks, int max) {
@@ -183,7 +214,8 @@ int gpu_gpu_clocks(int *clocks, int max) {
         "--format=csv,noheader,nounits",
         NULL
     };
-    if (exec_capture(argv, out, sizeof(out)) < 0) return -1;
+    /* nvidia-smi returns 0 on success; any non-zero exit is an error */
+    if (exec_capture(argv, out, sizeof(out)) != 0) return -1;
 
     int n = 0;
     const char *p = out;

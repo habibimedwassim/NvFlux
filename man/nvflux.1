@@ -91,6 +91,28 @@ No NVIDIA GPU detected or driver not loaded.
 .TP
 .B 5
 Unknown command.
+.SH NOTES
+.B Memory clock locking on Hopper and newer architectures:
+On GPUs based on the NVIDIA Hopper architecture (H100, H200) and later,
+.B \-\-lock\-memory\-clocks
+is not supported by
+.BR nvidia-smi .
+.B nvflux
+automatically falls back to
+.B \-\-lock\-memory\-clocks\-deferred
+for these GPUs.
+The deferred lock does not take effect immediately; a kernel module reload is
+required to activate it:
+.RS
+.B sudo rmmod nvidia && sudo modprobe nvidia
+.RE
+.PP
+A warning is printed to stderr whenever the deferred path is taken.
+.B GPU core clock locking:
+.B \-\-lock\-gpu\-clocks
+and
+.B \-\-reset\-gpu\-clocks
+are supported on Volta architecture and newer (GeForce RTX 2000 series and above).
 .SH SEE ALSO
 .BR nvidia-smi (1)
 .SH AUTHOR

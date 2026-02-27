@@ -45,13 +45,17 @@ int gpu_enable_persistence(void);
 
 /*
  * gpu_lock_mem - lock memory clock to exactly mhz MHz.
+ * Uses --lock-memory-clocks (-lmc); falls back to --lock-memory-clocks-deferred
+ * (-lmcd) on Hopper and newer datacenter architectures where -lmc is unsupported.
+ * Prints a warning when the deferred path is taken (driver reload required).
  * Returns 0 on success, non-zero on failure.
  */
 int gpu_lock_mem(int mhz);
 
 /*
  * gpu_unlock_mem - remove memory clock lock; driver resumes auto management.
- * Returns 0 on success, non-zero on failure.
+ * Tries --reset-memory-clocks (-rmc), then --reset-memory-clocks-deferred (-rmcd)
+ * for Hopper / newer architectures.  Returns 0 on success, non-zero on failure.
  */
 int gpu_unlock_mem(void);
 

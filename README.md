@@ -11,13 +11,13 @@ Clock tiers are queried live from the driver — nothing is hard-coded, so it wo
 All profiles work on **Wayland** and on **driver versions ≤ 580** where the nvidia-settings
 PowerMizer dropdown is broken.
 
-| Profile     | Memory clock                     | GPU core clock          | PowerMizer equivalent           |
-|-------------|----------------------------------|-------------------------|-----------------------------------|
-| ultra       | Locked to max                    | Locked to max           | Prefer Maximum Performance        |
-| performance | Locked to highest tier           | Not touched             | —                                 |
-| balanced    | Locked to mid-range tier         | Not touched             | —                                 |
-| powersave   | Locked to lowest tier            | Not touched             | —                                 |
-| auto        | Unlocked (driver managed)        | Unlocked (driver managed) | Adaptive                        |
+| Profile     | Memory clock              | GPU core clock          | PowerMizer equivalent          |
+|-------------|---------------------------|-------------------------|--------------------------------|
+| ultra       | Locked to max             | Locked to max           | Prefer Maximum Performance     |
+| performance | Locked to highest tier    | Reset to Adaptive       | —                              |
+| balanced    | Locked to mid-range tier  | Reset to Adaptive       | —                              |
+| powersave   | Locked to lowest tier     | Reset to Adaptive       | —                              |
+| auto        | Unlocked (driver-managed) | Unlocked (driver-managed) | Adaptive                     |
 
 ## Quick Start
 

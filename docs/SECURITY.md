@@ -17,8 +17,12 @@ sudo chmod 4750       /usr/local/bin/nvflux
 
 ## Known Limitations
 
-- `ultra` and `auto` affect both GPU core and memory clocks; `performance`,
-  `balanced`, and `powersave` touch only memory clocks (GPU core is left in
-  whatever state the driver has it in).
-- Applies to all GPUs (nvidia-smi default). Multi-GPU targeting is a possible future addition.
+- `ultra` locks both GPU core and memory clocks; `auto` unlocks both.
+  `performance`, `balanced`, and `powersave` lock only the memory clock and
+  explicitly reset the GPU core clock to driver-managed (Adaptive).
+- Memory clock locking (`--lock-memory-clocks`) is not supported on NVIDIA
+  Hopper architecture GPUs (H100 etc.). NvFlux automatically falls back to
+  `--lock-memory-clocks-deferred`, which requires a kernel-module reload to
+  take effect (`sudo rmmod nvidia && sudo modprobe nvidia`).
+- Applies to all GPUs (nvidia-smi default). Multi-GPU targeting via `-i` is a possible future addition.
 - No rate limiting on calls from the same user.
