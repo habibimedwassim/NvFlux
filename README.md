@@ -21,6 +21,20 @@ nvflux lets desktop users switch NVIDIA GPU power profiles without `sudo` by pro
 - ✅ Distro-agnostic, well-tested with unit tests
 - ✅ Fixes HDMI/DisplayPort audio dropouts caused by GPU P-state transitions
 
+## Requirements
+
+- **Runtime:** NVIDIA drivers with `nvidia-smi` (Volta+ for clock locking)
+- **Build:** C11 compiler, CMake 3.10+, gzip
+
+| Distro        | Command                                               |
+|---------------|-------------------------------------------------------|
+| Arch Linux    | `sudo pacman -S nvidia-utils base-devel cmake gzip`   |
+| Debian/Ubuntu | `sudo apt install build-essential cmake gzip` |
+| Fedora        | `sudo dnf install @development-tools cmake gzip`      |
+| openSUSE      | `sudo zypper install -t pattern devel_C_C++ cmake gzip` |
+| Solus         | `sudo eopkg it -c system.devel`                       |
+| Void Linux    | `sudo xbps-install -S base-devel cmake gzip nvidia-utils` |
+
 ## Quick Start
 
 ```bash
@@ -145,20 +159,6 @@ gcc -O2 -std=c11 -Iinclude \
     src/main.c src/nvidia.c src/profile.c src/state.c \
     -o nvflux
 ```
-
-## Requirements
-
-- **Runtime:** NVIDIA drivers with `nvidia-smi` (Volta+ for clock locking)
-- **Build:** C11 compiler, CMake 3.10+, gzip
-
-| Distro        | Command                                               |
-|---------------|-------------------------------------------------------|
-| Arch Linux    | `sudo pacman -S nvidia-utils base-devel cmake gzip`   |
-| Debian/Ubuntu | `sudo apt install build-essential cmake gzip` |
-| Fedora        | `sudo dnf install @development-tools cmake gzip`      |
-| openSUSE      | `sudo zypper install -t pattern devel_C_C++ cmake gzip` |
-| Solus         | `sudo eopkg it -c system.devel`                       |
-| Void Linux    | `sudo xbps-install -S base-devel cmake gzip nvidia-utils` |
 
 ## Testing
 
