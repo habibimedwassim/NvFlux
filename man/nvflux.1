@@ -1,121 +1,96 @@
-.\" nvflux(1)
-.TH NVFLUX 1 "February 2026" "nvflux 1.1.0" "User Commands"
+.TH NVFLUX 1 "2026" "nvflux 2.0.0" "User Commands"
 .SH NAME
 nvflux \- NVIDIA GPU clock profile manager
 .SH SYNOPSIS
 .B nvflux
-.RI [ COMMAND ]
+.I command
 .SH DESCRIPTION
-.B nvflux
-is a small setuid-root helper that lets unprivileged users manage NVIDIA GPU
-clock profiles via
-.BR nvidia-smi (1).
+nvflux is a setuid-root helper that locks or unlocks NVIDIA GPU memory and core
+clocks via
+.BR nvidia-smi (1)
+without requiring the user to invoke
+.BR sudo
+each time.
 Clock tiers are queried live from the driver; no values are hard-coded.
-All profiles work on Wayland and on driver versions \(<=\&580 where the
-nvidia-settings PowerMizer dropdown is unavailable.
 .SH COMMANDS
 .TP
 .B ultra
-Lock both the GPU core clock and memory clock to their maximum supported tiers.
+Lock both the memory clock and the GPU core clock to their maximum supported tier.
 Equivalent to PowerMizer \(lqPrefer Maximum Performance\(rq.
-Use this for gaming or compute workloads where maximum throughput is needed.
+Requires Volta+ GPU.
 .TP
 .B performance
-Lock memory clock to the highest supported tier.
-The GPU core clock lock is reset to driver-managed (Adaptive).
+Lock the memory clock to the highest supported tier.
+GPU core clock remains driver-managed.
 .TP
 .B balanced
-Lock memory clock to the mid-range supported tier.
-The GPU core clock lock is reset to driver-managed (Adaptive).
+Lock the memory clock to the mid-range supported tier.
+GPU core clock remains driver-managed.
 .TP
 .B powersave
-Lock memory clock to the lowest supported tier.
-The GPU core clock lock is reset to driver-managed (Adaptive).
+Lock the memory clock to the lowest supported tier.
+GPU core clock remains driver-managed.
 .TP
 .B auto
-Unlock all clocks; the driver manages both memory and GPU core clocks automatically.
-Equivalent to PowerMizer \(lqAdaptive\(rq.
+Remove all clock locks; return to fully driver-managed (Adaptive) mode.
+.TP
+.B reset
+Alias for
+.BR auto .
 .TP
 .B status
-Print the last saved profile for the calling user.
-Does not require root or a running NVIDIA driver.
+Print the last saved profile name.  Does not require root.
 .TP
 .B clock
-Print the current GPU memory clock in MHz.
+Print the current memory clock in MHz.  Does not require root.
 .TP
 .B \-\-restore
-Re-apply the last saved profile.
-Validates the saved name before executing; gives a clear error on corruption.
+Re-apply the last saved profile.  Useful in autostart scripts.
 .TP
-.B \-v\fR,\fB \-\-version
+.BR \-v , " \-\-version"
 Print version and exit.
 .TP
-.B \-h\fR,\fB \-\-help
-Print help and exit.
+.BR \-h , " \-\-help"
+Show usage summary and exit.
 .SH FILES
 .TP
 .I ~/.local/state/nvflux/state
-Per-user saved profile name (plain text, mode 0600, owned by real UID).
-The directory tree is created automatically on first write.
-.SH EXAMPLES
-Lock to performance profile:
-.RS
-.B nvflux performance
-.RE
-.PP
-Check current status (no root needed):
-.RS
-.B nvflux status
-.RE
-.PP
-Restore last saved profile on login (i3/Sway):
-.RS
-.B exec \-\-no\-startup\-id nvflux \-\-restore
-.RE
+Per-user state file recording the last applied profile.
+Owned by the real UID (not root), mode 0600.
 .SH EXIT STATUS
 .TP
-.B 0
+0
 Success.
 .TP
-.B 1
-Operational error (message printed to stderr).
+1
+Operational error (clock lock failed, no saved profile, etc.).
 .TP
-.B 2
+2
 nvidia-smi not found.
 .TP
-.B 3
-Not running as root.
+3
+Not running as root (effective UID ≠ 0).
 .TP
-.B 4
+4
 No NVIDIA GPU detected or driver not loaded.
 .TP
-.B 5
+5
 Unknown command.
 .SH NOTES
-.B Memory clock locking on Hopper and newer architectures:
-On GPUs based on the NVIDIA Hopper architecture (H100, H200) and later,
-.B \-\-lock\-memory\-clocks
-is not supported by
-.BR nvidia-smi .
-.B nvflux
-automatically falls back to
-.B \-\-lock\-memory\-clocks\-deferred
-for these GPUs.
-The deferred lock does not take effect immediately; a kernel module reload is
-required to activate it:
-.RS
-.B sudo rmmod nvidia && sudo modprobe nvidia
-.RE
+nvflux must be installed setuid root.
+.B scripts/install.sh
+performs this automatically.
 .PP
-A warning is printed to stderr whenever the deferred path is taken.
-.B GPU core clock locking:
-.B \-\-lock\-gpu\-clocks
-and
-.B \-\-reset\-gpu\-clocks
-are supported on Volta architecture and newer (GeForce RTX 2000 series and above).
+On Hopper+ GPUs,
+.B \-\-lock-memory-clocks
+is unsupported; nvflux falls back to
+.B \-\-lock-memory-clocks-deferred
+automatically and prints a note.
+The setting takes effect after a kernel module reload.
 .SH SEE ALSO
-.BR nvidia-smi (1)
-.SH AUTHOR
-Habibi Med Wassim
-.SH LICENSE
-MIT \(em see the LICENSE file distributed with this software.
+.BR nvidia-smi (1),
+.BR nvidia-settings (1)
+.PP
+nvidia-smi documentation: https://docs.nvidia.com/deploy/nvidia-smi/index.html
+.SH AUTHORS
+nvflux contributors.

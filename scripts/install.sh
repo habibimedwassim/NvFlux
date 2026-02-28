@@ -1,106 +1,66 @@
-#!/bin/sh
-# NvFlux installer: build, install setuid root, install man page.
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-INSTALL_BIN=/usr/local/bin/nvflux
-MAN_DIR=/usr/local/share/man/man1
+INSTALL_BIN="/usr/local/bin/nvflux"
+INSTALL_MAN="/usr/local/share/man/man1/nvflux.1.gz"
 
-[ "$(id -u)" -eq 0 ] || { echo "Run as root:  sudo $0" >&2; exit 1; }
+BASH_COMP="/etc/bash_completion.d/nvflux"
+FISH_COMP="/usr/share/fish/vendor_completions.d/nvflux.fish"
+ZSH_COMP="/usr/share/zsh/site-functions/_nvflux"
 
-./scripts/check-deps.sh || true  # advisory only
+SOURCE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
-echo "Building nvflux..."
+die() { echo "error: $*" >&2; exit 1; }
 
-if command -v cmake >/dev/null 2>&1 && [ -f CMakeLists.txt ]; then
-    cmake -S . -B _build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -Wno-dev
-    cmake --build _build --parallel "$(nproc 2>/dev/null || echo 1)"
-    BINARY=_build/nvflux
-elif command -v gcc >/dev/null 2>&1; then
-    gcc -O2 -Wall -I include -I src \
-        -o _nvflux_tmp \
-        src/main.c src/nvflux.c src/gpu.c src/state.c src/exec.c
-    BINARY=_nvflux_tmp
+[ "$(id -u)" -eq 0 ] || die "must run as root (sudo $0)"
+
+# ── Build ────────────────────────────────────────────────────────────────────
+echo "==> Building nvflux..."
+
+BUILD_DIR="$SOURCE_DIR/build"
+if command -v cmake &>/dev/null; then
+    cmake -S "$SOURCE_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=OFF -Wno-dev 2>/dev/null
+    cmake --build "$BUILD_DIR" --target nvflux -j"$(nproc)"
+    BINARY="$BUILD_DIR/nvflux"
 else
-    echo "Error: install cmake+make or gcc and retry." >&2; exit 1
+    echo "    cmake not found – using gcc fallback"
+    BINARY="$BUILD_DIR/nvflux_tmp"
+    mkdir -p "$BUILD_DIR"
+    gcc -O2 -std=c11 -Wall -I"$SOURCE_DIR/include" \
+        "$SOURCE_DIR/src/main.c"    \
+        "$SOURCE_DIR/src/nvidia.c"  \
+        "$SOURCE_DIR/src/profile.c" \
+        "$SOURCE_DIR/src/state.c"   \
+        -o "$BINARY"
 fi
 
-[ -x "$BINARY" ] || { echo "Build failed: no executable produced." >&2; exit 1; }
-
-install -Dm755 "$BINARY" "$INSTALL_BIN"
+# ── Install binary (setuid root) ─────────────────────────────────────────────
+echo "==> Installing to $INSTALL_BIN"
+install -Dm0755 "$BINARY" "$INSTALL_BIN"
 chown root:root "$INSTALL_BIN"
 chmod 4755      "$INSTALL_BIN"
-echo "Installed $INSTALL_BIN (setuid root)"
 
-if [ -f man/nvflux.1 ]; then
-    mkdir -p "$MAN_DIR"
-    gzip -c man/nvflux.1 > "$MAN_DIR/nvflux.1.gz"
-    command -v mandb >/dev/null 2>&1 && mandb >/dev/null 2>&1 || true
-    echo "Installed man page $MAN_DIR/nvflux.1.gz"
+# ── Install man page ─────────────────────────────────────────────────────────
+if [ -f "$SOURCE_DIR/man/nvflux.1" ]; then
+    echo "==> Installing man page"
+    mkdir -p "$(dirname "$INSTALL_MAN")"
+    gzip -c "$SOURCE_DIR/man/nvflux.1" > "$INSTALL_MAN"
 fi
 
 # ── Shell completions ─────────────────────────────────────────────────────────
-
-# bash
-if [ -f completions/bash/nvflux ]; then
-    if command -v pkg-config >/dev/null 2>&1; then
-        BASH_COMP_DIR=$(pkg-config --variable=completionsdir bash-completion 2>/dev/null)
+install_completion() {
+    local src="$1" dst="$2"
+    if [ -f "$src" ]; then
+        echo "==> Installing $(basename "$dst")"
+        mkdir -p "$(dirname "$dst")"
+        install -Dm0644 "$src" "$dst"
     fi
-    : "${BASH_COMP_DIR:=/usr/share/bash-completion/completions}"
-    [ -d /etc/bash_completion.d ] && [ ! -d "$BASH_COMP_DIR" ] && \
-        BASH_COMP_DIR=/etc/bash_completion.d
-    mkdir -p "$BASH_COMP_DIR"
-    install -Dm644 completions/bash/nvflux "$BASH_COMP_DIR/nvflux"
-    echo "Installed bash completion $BASH_COMP_DIR/nvflux"
-fi
+}
 
-# zsh
-if [ -f completions/zsh/_nvflux ]; then
-    # Try common site-functions directories in order of preference
-    for d in /usr/share/zsh/site-functions \
-              /usr/local/share/zsh/site-functions \
-              /usr/share/zsh/vendor-completions; do
-        if [ -d "$d" ]; then
-            ZSH_COMP_DIR="$d"
-            break
-        fi
-    done
-    # If zsh is installed but none of the dirs exist yet, use the first standard path
-    if [ -z "$ZSH_COMP_DIR" ] && command -v zsh >/dev/null 2>&1; then
-        ZSH_COMP_DIR=/usr/share/zsh/site-functions
-    fi
-    if [ -n "$ZSH_COMP_DIR" ]; then
-        mkdir -p "$ZSH_COMP_DIR"
-        install -Dm644 completions/zsh/_nvflux "$ZSH_COMP_DIR/_nvflux"
-        echo "Installed zsh completion $ZSH_COMP_DIR/_nvflux"
-    fi
-fi
+install_completion "$SOURCE_DIR/completions/bash/nvflux"      "$BASH_COMP"
+install_completion "$SOURCE_DIR/completions/fish/nvflux.fish" "$FISH_COMP"
+install_completion "$SOURCE_DIR/completions/zsh/_nvflux"      "$ZSH_COMP"
 
-# fish
-if [ -f completions/fish/nvflux.fish ]; then
-    for d in /usr/share/fish/vendor_completions.d \
-              /usr/share/fish/completions; do
-        if [ -d "$d" ]; then
-            FISH_COMP_DIR="$d"
-            break
-        fi
-    done
-    if [ -z "$FISH_COMP_DIR" ] && command -v fish >/dev/null 2>&1; then
-        FISH_COMP_DIR=/usr/share/fish/vendor_completions.d
-    fi
-    if [ -n "$FISH_COMP_DIR" ]; then
-        mkdir -p "$FISH_COMP_DIR"
-        install -Dm644 completions/fish/nvflux.fish "$FISH_COMP_DIR/nvflux.fish"
-        echo "Installed fish completion $FISH_COMP_DIR/nvflux.fish"
-    fi
-fi
-
-# Create state directory owned by the invoking (non-root) user
-USER=${SUDO_USER:-$(logname 2>/dev/null || whoami)}
-HOME_DIR=$(eval echo "~$USER")
-STATE_DIR="$HOME_DIR/.local/state/nvflux"
-mkdir -p "$STATE_DIR"
-chown "$USER:$USER" "$STATE_DIR" 2>/dev/null || true
-echo "State directory: $STATE_DIR"
-
-rm -rf _build _nvflux_tmp 2>/dev/null || true
-echo "Done.  Try: nvflux --help"
+echo ""
+echo "Done! nvflux $("$INSTALL_BIN" --version) installed."
+echo "Run 'nvflux --help' to get started."

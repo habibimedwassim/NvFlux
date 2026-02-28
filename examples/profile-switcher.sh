@@ -1,33 +1,73 @@
-#!/bin/sh
-# Interactive GPU profile switcher using nvflux.
-set -e
+#!/usr/bin/env bash
+# Interactive nvflux profile switcher.
+# Run from a terminal; select a profile with arrow keys or its number.
 
-command -v nvflux >/dev/null 2>&1 || { echo "Error: nvflux not installed." >&2; exit 1; }
+set -euo pipefail
 
-printf "Current profile : %s\n" "$(nvflux status)"
-printf "Current mem clock: %s\n\n" "$(nvflux clock)"
+PROFILES=(ultra performance balanced powersave auto)
+DESCRIPTIONS=(
+    "Max clocks — full GPU + memory lock"
+    "High clocks — memory lock at maximum"
+    "Mid clocks  — memory lock at midpoint"
+    "Low clocks  — memory lock at minimum"
+    "Default     — reset all clock locks"
+)
 
-cat <<'EOF'
-  1) Ultra        (GPU + memory at max clocks — PowerMizer: Prefer Max Performance)
-  2) Performance  (memory highest tier, GPU clock untouched)
-  3) Balanced     (memory mid tier, GPU clock untouched)
-  4) Power Save   (memory lowest tier, GPU clock untouched)
-  5) Auto         (unlock all clocks — PowerMizer: Adaptive)
-  6) Exit
-EOF
+# ── helpers ────────────────────────────────────────────────────────────────────
 
-printf "\nChoice [1-6]: "
-read -r choice
+current_profile() {
+    local state="$HOME/.local/state/nvflux/state"
+    [[ -f "$state" ]] && cat "$state" || echo "unknown"
+}
 
-case "$choice" in
-    1) nvflux ultra       ;;
-    2) nvflux performance ;;
-    3) nvflux balanced    ;;
-    4) nvflux powersave   ;;
-    5) nvflux auto        ;;
-    6) exit 0             ;;
-    *) echo "Invalid choice." >&2; exit 1 ;;
-esac
+print_menu() {
+    local current
+    current=$(current_profile)
+    echo ""
+    echo "  nvflux profile switcher"
+    echo "  Current: $current"
+    echo ""
+    for i in "${!PROFILES[@]}"; do
+        local marker="  "
+        [[ "${PROFILES[$i]}" == "$current" ]] && marker="> "
+        printf "  %s[%d] %-14s %s\n" "$marker" $((i+1)) "${PROFILES[$i]}" "${DESCRIPTIONS[$i]}"
+    done
+    echo ""
+    echo "  [q] Quit"
+    echo ""
+}
 
-printf "\nNew profile : %s\n" "$(nvflux status)"
-printf "New mem clock: %s\n"  "$(nvflux clock)"
+apply_profile() {
+    local profile="$1"
+    echo "  Applying: $profile …"
+    if nvflux "$profile"; then
+        echo "  Done."
+    else
+        echo "  Error: nvflux exited with status $?"
+    fi
+    sleep 1
+}
+
+# ── main ───────────────────────────────────────────────────────────────────────
+
+if ! command -v nvflux &>/dev/null; then
+    echo "Error: nvflux not found in PATH." >&2
+    exit 1
+fi
+
+while true; do
+    clear
+    print_menu
+    printf "  Choice: "
+    read -r choice
+
+    case "$choice" in
+        1|ultra)       apply_profile ultra ;;
+        2|performance) apply_profile performance ;;
+        3|balanced)    apply_profile balanced ;;
+        4|powersave)   apply_profile powersave ;;
+        5|auto|reset)  apply_profile auto ;;
+        q|Q|quit|exit) echo ""; break ;;
+        *) echo "  Invalid choice." ; sleep 0.5 ;;
+    esac
+done

@@ -1,29 +1,8 @@
 # bash completion for nvflux
-# Install to:
-#   /usr/share/bash-completion/completions/nvflux   (preferred, most distros)
-#   /etc/bash_completion.d/nvflux                   (legacy fallback)
-
 _nvflux()
 {
-    local cur prev
-    # Use bash-completion library helper when available; plain fallback otherwise
-    if declare -f _init_completion >/dev/null 2>&1; then
-        local words cword
-        _init_completion || return
-    else
-        cur="${COMP_WORDS[COMP_CWORD]}"
-        prev="${COMP_WORDS[COMP_CWORD-1]}"
-    fi
-
-    # nvflux accepts exactly one positional argument; stop after it
-    if [ "${COMP_CWORD}" -gt 1 ]; then
-        COMPREPLY=()
-        return 0
-    fi
-
-    local commands="ultra performance balanced powersave auto status clock --restore --version --help"
-    COMPREPLY=( $(compgen -W "${commands}" -- "${cur}") )
-    return 0
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local commands="ultra performance balanced powersave auto status clock --restore --help --version"
+    COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
 }
-
 complete -F _nvflux nvflux

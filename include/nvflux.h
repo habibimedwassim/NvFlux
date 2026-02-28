@@ -1,32 +1,16 @@
-/*
- * nvflux.h - public API
- *
- * Only the symbols needed by main.c and the test suite are exposed here.
- * Everything else is internal to its own translation unit.
- */
-#ifndef NVFLUX_H
-#define NVFLUX_H
+#pragma once
 
-#define NVFLUX_VERSION "1.1.0"
+#define NVFLUX_VERSION "2.0.0"
 
-/*
- * nvflux_run - process argv and execute the requested command.
- *
- * Return values (used as process exit codes):
- *   0  success
- *   1  usage / operational error (message already printed)
- *   2  nvidia-smi not found
- *   3  not running as root
- *   4  no NVIDIA GPU / driver not loaded
- *   5  unknown command
- */
-int nvflux_run(int argc, char **argv);
+/* Clock profiles managed by nvflux. */
+typedef enum {
+    PROFILE_ULTRA       = 0,   /* lock mem + GPU core to max          */
+    PROFILE_PERFORMANCE = 1,   /* lock mem to max,  GPU core adaptive  */
+    PROFILE_BALANCED    = 2,   /* lock mem to mid,  GPU core adaptive  */
+    PROFILE_POWERSAVE   = 3,   /* lock mem to min,  GPU core adaptive  */
+    PROFILE_AUTO        = 4,   /* reset all locks (driver-managed)    */
+} Profile;
 
-/*
- * nvflux_parse_clocks - parse integers from whitespace/comma-separated text
- * into clocks[], sorted descending.  Returns the number of values parsed
- * (<= max).  Used internally and exposed for unit testing.
- */
-int nvflux_parse_clocks(const char *txt, int *clocks, int max);
-
-#endif /* NVFLUX_H */
+/* Returns 0 on success, -1 if s is not a recognised profile name. */
+int         profile_from_str(const char *s, Profile *out);
+const char *profile_to_str(Profile p);

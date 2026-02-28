@@ -1,28 +1,72 @@
-# Security Model
+# Security Policy
 
-## Principles
+## Supported Versions
 
-- **Allowlist**: only profile names from the hardcoded `profiles[]` table are accepted; `--restore` validates the saved name against this table before acting.
-- **No shell**: all subprocess calls use `fork`/`execv` directly — no `system()`, no string interpolation into commands.
-- **Privilege scope**: root (`geteuid()==0`) is used only for `nvidia-smi` calls. The `status` command runs entirely unprivileged.
-- **State file ownership**: written as real UID (not root), mode 0600, in `~/.local/state/nvflux/state`.
+| Version | Supported |
+| ------- | --------- |
+| 2.x     | Yes       |
+| < 2.0   | No        |
 
-## Installation Note
+## Security Model
 
-Installing a setuid-root binary has security implications. Review `src/` before deploying. To restrict to a group:
-```sh
-sudo chown root:wheel /usr/local/bin/nvflux
-sudo chmod 4750       /usr/local/bin/nvflux
-```
+### Privilege Handling
 
-## Known Limitations
+nvflux requires root to call `nvidia-smi` with clock-locking flags.
+The binary is installed **setuid root** (`-rwsr-xr-x`).
 
-- `ultra` locks both GPU core and memory clocks; `auto` unlocks both.
-  `performance`, `balanced`, and `powersave` lock only the memory clock and
-  explicitly reset the GPU core clock to driver-managed (Adaptive).
-- Memory clock locking (`--lock-memory-clocks`) is not supported on NVIDIA
-  Hopper architecture GPUs (H100 etc.). NvFlux automatically falls back to
-  `--lock-memory-clocks-deferred`, which requires a kernel-module reload to
-  take effect (`sudo rmmod nvidia && sudo modprobe nvidia`).
-- Applies to all GPUs (nvidia-smi default). Multi-GPU targeting via `-i` is a possible future addition.
-- No rate limiting on calls from the same user.
+Privilege is dropped as early as possible:
+- Commands that do not need root (`status`, `clock`) run entirely as the real user.
+- Only `profile_apply()` and `--restore` retain elevated privileges.
+- The setuid approach was chosen over `sudo` to allow desktop autostart without a terminal.
+
+### Command Validation
+
+All `nvidia-smi` invocations use **`execv()` with an explicit argument list**.
+There is no shell interpolation (`system()` is never called).
+Untrusted string input (profile names) is validated against a fixed allowlist
+via `profile_from_str()` before any value reaches `nvidia-smi`.
+
+### State File
+
+The state file at `~/.local/state/nvflux/state` stores only the last active
+profile name (a short ASCII string).
+
+- Created with mode `0600`.
+- Ownership is `fchown`-ed to the **real UID** immediately after creation,
+  preventing root from owning the file in the user's home directory.
+- The file is read by `--restore` and validated through `profile_from_str()`
+  before use; a corrupted/malicious state file will produce an "unknown profile"
+  error and exit cleanly.
+
+### Attack Surface Reduction
+
+| Vector | Mitigation |
+| ------ | ---------- |
+| Argument injection | Fixed argument arrays; no shell expansion |
+| Path traversal | nvidia-smi path resolved once at startup via `nv_init()`, not user-controlled |
+| Buffer overflows | Stack buffers sized with `PATH_MAX`/`NV_MAX_CLOCKS` constants; `fgets`/`snprintf` throughout |
+| Integer overflows | Clock values are `int` parsed with `strtol`; unused high-range values are discarded |
+| Symlink attacks | State directory created with `mkdir -p`; ownership validated after open |
+
+### What nvflux Does NOT Do
+
+- Does **not** expose a network socket or D-Bus interface.
+- Does **not** write to system paths other than via the install script.
+- Does **not** parse GPU vendor strings or firmware blobs.
+- Does **not** store passwords, tokens, or any secret material.
+
+## Reporting a Vulnerability
+
+Please **do not** open a public issue for security vulnerabilities.
+
+Open a [GitHub Security Advisory](https://docs.github.com/en/code-security/security-advisories)
+in the repository, or email the maintainer directly (see `git log` for contact).
+
+Include:
+- Description of the vulnerability
+- Steps to reproduce
+- Affected version(s)
+- Suggested fix (optional)
+
+You can expect an acknowledgement within **48 hours** and a patch within **7 days**
+for confirmed vulnerabilities.

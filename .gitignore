@@ -1,7 +1,5 @@
-_build/
 build/
 *.o
-/nvflux
-test_nvflux
-_nvflux_tmp
-*.gz
+*.a
+.cache/
+compile_commands.json

@@ -2,80 +2,92 @@
 
 ## Quick Install
 
-```sh
+```bash
+# 1. Verify dependencies
+./scripts/check-deps.sh
+
+# 2. Build and install
 sudo ./scripts/install.sh
+
+# 3. Verify
+nvflux --version
+ls -l /usr/local/bin/nvflux   # should be -rwsr-xr-x (setuid root)
 ```
 
-Builds the binary, installs to `/usr/local/bin/nvflux` with the setuid root bit, installs the man page, and creates the state directory.
+## Manual Build
 
-## Dependencies
-
-| Package            | Distro name                              |
-|--------------------|------------------------------------------|
-| C compiler         | `build-essential` / `base-devel` / `gcc` |
-| CMake ≥ 3.10       | `cmake`                                  |
-| gzip               | `gzip`                                   |
-| nvidia-smi         | `nvidia-utils`                           |
-
-### Debian / Ubuntu
-```sh
-sudo apt install build-essential cmake gzip nvidia-utils
-```
-
-### Arch Linux
-```sh
-sudo pacman -Syu base-devel cmake gzip nvidia-utils
-```
-
-### Fedora
-```sh
-sudo dnf install @development-tools cmake gzip
-# NVIDIA drivers: enable RPM Fusion repository
-```
-
-### openSUSE
-```sh
-sudo zypper install -t pattern devel_C_C++ cmake gzip
-```
-
-### Void Linux
-```sh
-sudo xbps-install -S base-devel cmake gzip nvidia-utils
-```
-
-## Manual Build + Install
-
-```sh
+```bash
+# CMake (recommended)
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
-
 sudo install -Dm4755 nvflux /usr/local/bin/nvflux
 sudo gzip -c ../man/nvflux.1 > /usr/local/share/man/man1/nvflux.1.gz
+
+# Or with gcc directly (no cmake needed)
+gcc -O2 -std=c11 -Iinclude \
+    src/main.c src/nvidia.c src/profile.c src/state.c \
+    -o nvflux
+sudo install -Dm4755 nvflux /usr/local/bin/nvflux
 ```
 
-## Autostart
+## Distribution-Specific Dependencies
+
+### Arch Linux
+```bash
+sudo pacman -S nvidia-utils base-devel cmake gzip
+```
+
+### Debian / Ubuntu
+```bash
+sudo apt install nvidia-utils build-essential cmake gzip
+```
+
+For the NVIDIA driver itself, use your distro's recommended method or:
+```bash
+sudo ubuntu-drivers install   # Ubuntu
+sudo apt install nvidia-driver # Debian
+```
+
+### Fedora
+```bash
+sudo dnf install @development-tools cmake gzip
+# NVIDIA driver: use RPM Fusion
+sudo dnf install akmod-nvidia
+```
+
+### openSUSE
+```bash
+sudo zypper install -t pattern devel_C_C++
+sudo zypper install cmake gzip
+```
+
+### Solus
+```bash
+sudo eopkg it -c system.devel
+sudo eopkg it nvidia-glx-driver
+```
+
+### Void Linux
+```bash
+sudo xbps-install -S base-devel cmake gzip nvidia-utils
+```
+
+## Autostart Configuration
+
+nvflux can restore your last profile on login.
 
 ### i3 / Sway
+Add to `~/.config/i3/config` or `~/.config/sway/config`:
 ```
 exec --no-startup-id nvflux --restore
 ```
 
-### GNOME / KDE / XFCE (XDG autostart)
-```ini
-# ~/.config/autostart/nvflux-restore.desktop
-[Desktop Entry]
-Type=Application
-Name=nvflux restore
-Exec=nvflux --restore
-X-GNOME-Autostart-enabled=true
-```
-
 ### systemd user service
+Create `~/.config/systemd/user/nvflux-restore.service`:
 ```ini
-# ~/.config/systemd/user/nvflux-restore.service
 [Unit]
-Description=Restore NVIDIA GPU profile
+Description=Restore nvflux GPU profile
 After=graphical-session.target
 
 [Service]
@@ -83,13 +95,36 @@ Type=oneshot
 ExecStart=/usr/local/bin/nvflux --restore
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
 ```
-```sh
+
+Enable it:
+```bash
 systemctl --user enable --now nvflux-restore.service
 ```
 
-## Uninstall
-```sh
+## Shell Completions
+
+The install script handles this automatically. For manual installation:
+
+```bash
+# Bash
+sudo install -Dm0644 completions/bash/nvflux /etc/bash_completion.d/nvflux
+
+# Fish
+sudo install -Dm0644 completions/fish/nvflux.fish \
+    /usr/share/fish/vendor_completions.d/nvflux.fish
+
+# Zsh
+sudo install -Dm0644 completions/zsh/_nvflux \
+    /usr/share/zsh/site-functions/_nvflux
+```
+
+## Uninstallation
+
+```bash
 sudo ./scripts/uninstall.sh
 ```
+
+This removes the binary, man page, and shell completions.
+User state files (`~/.local/state/nvflux/`) are left intact.
