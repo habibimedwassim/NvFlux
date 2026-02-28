@@ -39,11 +39,11 @@ else
     fi
     case "$distro" in
         *arch*|arch)
-            echo "  sudo pacman -S nvidia-utils cmake gcc gzip" ;;
+            echo "  sudo pacman -S nvidia-utils base-devel cmake gzip" ;;
         *debian*|*ubuntu*|debian|ubuntu)
-            echo "  sudo apt install build-essential cmake gzip nvidia-utils" ;;
+            echo "  sudo apt install build-essential cmake gzip" ;;
         *fedora*|*rhel*|*centos*|fedora)
-            echo "  sudo dnf install @development-tools cmake gzip nvidia-smi" ;;
+            echo "  sudo dnf install @development-tools cmake gzip" ;;
         *suse*|opensuse)
             echo "  sudo zypper install -t pattern devel_C_C++ cmake gzip" ;;
         solus)
